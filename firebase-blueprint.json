@@ -1,0 +1,57 @@
+{
+  "entities": {
+    "Trek": {
+      "title": "Trek",
+      "description": "A trekking trip instance",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "description": "Name of the trek" },
+        "type": { "type": "string", "enum": ["Trek", "Expedition", "Climb"], "description": "Type of trek" },
+        "startDate": { "type": "string", "format": "date", "description": "Start date of the trek" },
+        "endDate": { "type": "string", "format": "date", "description": "End date of the trek" },
+        "pax": { "type": "integer", "description": "Number of participants" },
+        "region": { "type": "string", "description": "Region of the trek (e.g., Nepal, Sikkim)" },
+        "location": { "type": "string", "description": "Specific location details" },
+        "status": { "type": "string", "enum": ["planning", "active", "completed"], "description": "Overall status" }
+      },
+      "required": ["name", "type", "startDate", "region"]
+    },
+    "Task": {
+      "title": "Task",
+      "description": "A specific task for a trek and category",
+      "type": "object",
+      "properties": {
+        "trekId": { "type": "string", "description": "ID of the trek this task belongs to" },
+        "category": { "type": "string", "description": "Category (Transport, Permits, etc.)" },
+        "title": { "type": "string", "description": "Task title" },
+        "description": { "type": "string", "description": "Task details" },
+        "deadlineOffset": { "type": "integer", "description": "Days before start" },
+        "status": { "type": "string", "enum": ["pending", "completed"], "description": "Task status" },
+        "value": { "type": "any", "description": "Value for number or amount types" },
+        "fileUrl": { "type": "string", "description": "URL of uploaded file" },
+        "isNA": { "type": "boolean", "description": "Whether the task is Not Applicable" },
+        "subtasks": { "type": "array", "description": "List of subtasks or additional details" },
+        "completedAt": { "type": "string", "format": "date-time", "description": "When the task was completed" },
+        "completedBy": { "type": "string", "description": "User ID who completed the task" }
+      },
+      "required": ["trekId", "category", "title", "status"]
+    },
+    "TeamMember": {
+      "title": "Team Member",
+      "description": "A member of the operations team",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "Firebase Auth UID" },
+        "name": { "type": "string", "description": "Full name" },
+        "role": { "type": "string", "enum": ["Ground Ops", "Support", "Trip Leader", "Head Office"], "description": "Team role" },
+        "email": { "type": "string", "format": "email", "description": "Email address" }
+      },
+      "required": ["uid", "name", "role", "email"]
+    }
+  },
+  "firestore": {
+    "/treks": { "schema": "Trek", "description": "Collection of all treks" },
+    "/tasks": { "schema": "Task", "description": "Collection of all tasks across all treks" },
+    "/team": { "schema": "TeamMember", "description": "Collection of team members" }
+  }
+}

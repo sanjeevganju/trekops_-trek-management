@@ -1,0 +1,129 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: treks
+    // Document ID: auto-generated
+    // Fields:
+    //   - name: string (required)
+    //   - type: string (required, enum: Trek, Expedition, Climb)
+    //   - startDate: string (required, format: date)
+    //   - endDate: string (optional, format: date)
+    //   - pax: number (optional)
+    //   - region: string (required)
+    //   - location: string (required)
+    //   - status: string (optional, enum: planning, active, completed)
+    //
+    // Collection: tasks
+    // Document ID: auto-generated
+    // Fields:
+    //   - trekId: string (required)
+    //   - category: string (required, enum: Transport, Permits, Equipment, Kitchen, Team Assigned, Field Accounts)
+    //   - title: string (required)
+    //   - description: string (optional)
+    //   - deadlineOffset: number (optional)
+    //   - status: string (required, enum: pending, completed)
+    //   - type: string (required, enum: number, text, file, select, amount)
+    //   - value: any (optional)
+    //   - fileUrl: string (optional)
+    //   - isNA: boolean (optional)
+    //   - completedAt: string (optional, format: date-time)
+    //   - completedBy: string (optional, uid)
+    //
+    // Collection: team
+    // Document ID: uid
+    // Fields:
+    //   - uid: string (required)
+    //   - name: string (required)
+    //   - role: string (required, enum: Ground Ops, Support, Trip Leader, Head Office)
+    //   - email: string (required, format: email)
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    function isAdmin() {
+      return isAuthenticated() && 
+        (request.auth.token.email == "info@whitemagicadventure.com" ||
+         (exists(/databases/$(database)/documents/team/$(request.auth.uid)) && get(/databases/$(database)/documents/team/$(request.auth.uid)).data.role == 'Head Office'));
+    }
+
+    function isDocOwner() {
+      return isAuthenticated() && request.auth.uid == resource.data.createdBy;
+    }
+
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    function isValidTrek(data) {
+      return data.name is string && data.name.size() > 0 && data.name.size() < 100 &&
+             data.type in ['Trek', 'Expedition', 'Climb'] &&
+             data.startDate is string &&
+             data.region is string &&
+             (!('location' in data) || data.location is string) &&
+             data.createdBy is string;
+    }
+
+    function isTrekUpdateAllowed(trekId) {
+      let data = request.resource.data;
+      let existing = resource.data;
+      return isAuthenticated() && 
+             isValidTrek(data) && 
+             (isAdmin() || (isDocOwner() && data.createdBy == existing.createdBy));
+    }
+
+    function isValidTask(data) {
+      return data.trekId is string &&
+             data.category in ['Transport', 'Permits', 'Equipment', 'Kitchen', 'Team Assigned', 'Field Accounts'] &&
+             data.title is string && data.title.size() > 0 && data.title.size() < 200 &&
+             data.status in ['pending', 'completed'] &&
+             data.type in ['number', 'text', 'file', 'select', 'amount'] &&
+             (!('subtasks' in data) || data.subtasks is list);
+    }
+
+    function isValidTeamMember(data) {
+      return data.uid is string &&
+             data.name is string && data.name.size() > 0 && data.name.size() < 100 &&
+             data.role in ['Ground Ops', 'Support', 'Trip Leader', 'Head Office'] &&
+             data.email is string;
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /treks/{trekId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && isValidTrek(request.resource.data) && request.resource.data.createdBy == request.auth.uid;
+      allow update: if isTrekUpdateAllowed(trekId);
+      allow delete: if isAdmin() || isDocOwner();
+    }
+
+    match /tasks/{taskId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && isValidTask(request.resource.data);
+      allow update: if isAuthenticated() && isValidTask(request.resource.data);
+      allow delete: if isAdmin() || (isAuthenticated() && exists(/databases/$(database)/documents/treks/$(resource.data.trekId)) && get(/databases/$(database)/documents/treks/$(resource.data.trekId)).data.createdBy == request.auth.uid);
+    }
+
+    match /team/{userId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && (isOwner(userId) || isAdmin()) && isValidTeamMember(request.resource.data);
+      allow update: if isAuthenticated() && (isOwner(userId) || isAdmin()) && isValidTeamMember(request.resource.data);
+    }
+  }
+}
