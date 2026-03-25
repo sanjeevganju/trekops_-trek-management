@@ -7,8 +7,9 @@ export interface StaffMember {
 
 export async function fetchStaffList(): Promise<StaffMember[]> {
   try {
-    // Using gid=1562851350 for Sheet5 as seen in screenshot
-    const url = 'https://docs.google.com/spreadsheets/d/1Ft94dOMfapiHeHh3IdRUBOMgPhRf6WTFZnv51aVwWK8/export?format=csv&gid=1562851350';
+    const spreadsheetId = import.meta.env.VITE_SHEET_ID || '1Ft94dOMfapiHeHh3IdRUBOMgPhRf6WTFZnv51aVwWK8';
+    const gid = import.meta.env.VITE_STAFF_GID || '1562851350';
+    const url = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/export?format=csv&gid=${gid}`;
     const response = await fetch(url);
     if (!response.ok) throw new Error('Failed to fetch staff list');
     

@@ -75,6 +75,7 @@ import { TASK_TEMPLATES, TrekType, Category, TaskTemplate, REGIONS } from './con
 import { formatDate, formatDeadline, isOverdue } from './utils';
 import { fetchStaffList, StaffMember } from './services/staffService';
 import { fetchSalesTrips, SalesTrip } from './services/salesService';
+import { fetchDrivers, fetchVehicles, Driver, Vehicle } from './services/transportService';
 
 // --- Error Handling ---
 enum OperationType {
@@ -210,6 +211,7 @@ interface TrekInstance {
   region: string;
   location: string;
   status: 'planning' | 'active' | 'completed';
+  createdAt?: any;
 }
 
 // --- Main App ---
@@ -233,6 +235,8 @@ function TrekOpsApp() {
   const [showCompleted, setShowCompleted] = useState(false);
   const [staff, setStaff] = useState<StaffMember[]>([]);
   const [salesTrips, setSalesTrips] = useState<SalesTrip[]>([]);
+  const [drivers, setDrivers] = useState<Driver[]>([]);
+  const [vehicles, setVehicles] = useState<Vehicle[]>([]);
   const [isLoadingSales, setIsLoadingSales] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
   const [salesError, setSalesError] = useState<string | null>(null);
@@ -386,6 +390,23 @@ function TrekOpsApp() {
       setStaff(list);
     };
     loadStaff();
+  }, [isAuthReady, user]);
+
+  // Fetch Transport Data
+  useEffect(() => {
+    if (!isAuthReady || !user) return;
+    const loadTransportData = async () => {
+      console.log('App: Loading transport data...');
+      const [driverList, vehicleList] = await Promise.all([
+        fetchDrivers(),
+        fetchVehicles()
+      ]);
+      console.log('App: Drivers loaded:', driverList.length);
+      console.log('App: Vehicles loaded:', vehicleList.length);
+      setDrivers(driverList);
+      setVehicles(vehicleList);
+    };
+    loadTransportData();
   }, [isAuthReady, user]);
 
   const parseTrekDate = (date: any): Date => {
@@ -1693,10 +1714,8 @@ function TrekOpsApp() {
                                     <div key={vIdx} className="p-4 rounded-2xl border border-slate-100 bg-slate-50/30 space-y-3">
                                       <h5 className="text-[10px] font-black text-emerald-600 uppercase tracking-widest">Vehicle {vIdx + 1}</h5>
                                       <div className="space-y-2">
-                                        <input 
-                                          type="text" 
+                                        <select 
                                           disabled={isReadOnly}
-                                          placeholder="Vehicle Make (e.g., SUV, Tempo)"
                                           className="w-full bg-white border border-slate-200 rounded-xl px-4 py-2.5 text-sm outline-none focus:ring-2 focus:ring-emerald-500 disabled:opacity-50"
                                           value={task.subtasks?.[vIdx]?.make || ''}
                                           onChange={(e) => {
@@ -1704,7 +1723,10 @@ function TrekOpsApp() {
                                             newSubtasks[vIdx] = { ...(newSubtasks[vIdx] || {}), make: e.target.value };
                                             updateTaskValue(task.id, 'subtasks', newSubtasks);
                                           }}
-                                        />
+                                        >
+                                          <option value="">Select Vehicle Make...</option>
+                                          {vehicles.map((v, idx) => <option key={`${v.make}-${idx}`} value={v.make}>{v.make}</option>)}
+                                        </select>
                                         <input 
                                           type="text" 
                                           disabled={isReadOnly}
@@ -1717,18 +1739,26 @@ function TrekOpsApp() {
                                             updateTaskValue(task.id, 'subtasks', newSubtasks);
                                           }}
                                         />
-                                        <input 
-                                          type="text" 
+                                        <select 
                                           disabled={isReadOnly}
-                                          placeholder="Driver Name"
                                           className="w-full bg-white border border-slate-200 rounded-xl px-4 py-2.5 text-sm outline-none focus:ring-2 focus:ring-emerald-500 disabled:opacity-50"
                                           value={task.subtasks?.[vIdx]?.driverName || ''}
                                           onChange={(e) => {
                                             const newSubtasks = [...(task.subtasks || [])];
-                                            newSubtasks[vIdx] = { ...(newSubtasks[vIdx] || {}), driverName: e.target.value };
+                                            const selectedDriver = drivers.find(d => d.name === e.target.value);
+                                            newSubtasks[vIdx] = { 
+                                              ...(newSubtasks[vIdx] || {}), 
+                                              driverName: e.target.value,
+                                              contact: selectedDriver?.contact || newSubtasks[vIdx]?.contact || ''
+                                            };
                                             updateTaskValue(task.id, 'subtasks', newSubtasks);
                                           }}
-                                        />
+                                        >
+                                          <option value="">Select Driver...</option>
+                                          {drivers
+                                            .filter(d => !selectedTrek?.region || d.region === selectedTrek.region)
+                                            .map((d, idx) => <option key={`${d.name}-${idx}`} value={d.name}>{d.name}</option>)}
+                                        </select>
                                         <input 
                                           type="text" 
                                           disabled={isReadOnly}

@@ -1,5 +1,5 @@
 {
   "name": "TrekOps: Trek Management",
-  "description": "A task management app for trekking companies to coordinate Ground Ops, Support, and Trip Leaders across various trek types.",
+  "description": "A task management app for trekking companies to coordinate Ground Ops, Support, and Trip Leaders across various trek types, with integrated transport and driver management.",
   "requestFramePermissions": []
 }

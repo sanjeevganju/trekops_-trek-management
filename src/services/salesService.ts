@@ -1,7 +1,7 @@
 import Papa from 'papaparse';
 
-const SPREADSHEET_ID = '1Ft94dOMfapiHeHh3IdRUBOMgPhRf6WTFZnv51aVwWK8';
-const GID = '1778692444'; // Sheet7
+const SPREADSHEET_ID = import.meta.env.VITE_SHEET_ID || '1Ft94dOMfapiHeHh3IdRUBOMgPhRf6WTFZnv51aVwWK8';
+const GID = import.meta.env.VITE_SALES_GID || '1778692444'; // Sheet7
 
 export interface SalesTrip {
   id: string;
