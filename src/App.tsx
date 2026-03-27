@@ -68,7 +68,8 @@ import {
 import { 
   ref, 
   uploadBytesResumable, 
-  getDownloadURL 
+  getDownloadURL,
+  deleteObject
 } from 'firebase/storage';
 import { db, auth, storage } from './firebase';
 import { TASK_TEMPLATES, TrekType, Category, TaskTemplate, REGIONS } from './constants';
@@ -552,6 +553,25 @@ function TrekOpsApp() {
       console.error('File upload error:', error);
       setUploadingTaskId(null);
       setSalesError('Failed to upload file.');
+    }
+  };
+
+  const handleDeleteFile = async (taskId: string, fileUrl: string) => {
+    try {
+      // Create a reference to the file to delete
+      const fileRef = ref(storage, fileUrl);
+      
+      // Delete the file from storage
+      await deleteObject(fileRef);
+      
+      // Update the task in Firestore
+      await updateTaskValue(taskId, 'fileUrl', null);
+      
+      console.log('File deleted successfully');
+    } catch (error) {
+      console.error('Error deleting file:', error);
+      // Even if storage delete fails (e.g. file already gone), we still want to clear the reference in Firestore
+      await updateTaskValue(taskId, 'fileUrl', null);
     }
   };
 
@@ -1874,14 +1894,25 @@ function TrekOpsApp() {
                                                 <FileText className="w-4 h-4" />
                                                 <span className="text-xs font-bold truncate max-w-[150px]">Voucher Uploaded</span>
                                               </div>
-                                              <a 
-                                                href={task.fileUrl} 
-                                                target="_blank" 
-                                                rel="noopener noreferrer"
-                                                className="text-[10px] font-black text-emerald-600 uppercase tracking-widest hover:underline"
-                                              >
-                                                View
-                                              </a>
+                                              <div className="flex items-center gap-3">
+                                                <a 
+                                                  href={task.fileUrl} 
+                                                  target="_blank" 
+                                                  rel="noopener noreferrer"
+                                                  className="text-[10px] font-black text-emerald-600 uppercase tracking-widest hover:underline"
+                                                >
+                                                  View
+                                                </a>
+                                                {!isReadOnly && (
+                                                  <button
+                                                    onClick={() => handleDeleteFile(task.id, task.fileUrl)}
+                                                    className="p-1 text-rose-500 hover:bg-rose-100 rounded-lg transition-colors"
+                                                    title="Delete file"
+                                                  >
+                                                    <Trash2 className="w-3.5 h-3.5" />
+                                                  </button>
+                                                )}
+                                              </div>
                                             </div>
                                           ) : (
                                             <label className="w-full border-2 border-dashed border-slate-200 rounded-2xl py-3 flex flex-col items-center justify-center gap-2 text-slate-400 hover:border-emerald-300 hover:text-emerald-500 transition-all cursor-pointer">
@@ -1917,14 +1948,25 @@ function TrekOpsApp() {
                                             <FileText className="w-4 h-4" />
                                             <span className="text-xs font-bold truncate max-w-[150px]">File Uploaded</span>
                                           </div>
-                                          <a 
-                                            href={task.fileUrl} 
-                                            target="_blank" 
-                                            rel="noopener noreferrer"
-                                            className="text-[10px] font-black text-emerald-600 uppercase tracking-widest hover:underline"
-                                          >
-                                            View
-                                          </a>
+                                          <div className="flex items-center gap-3">
+                                            <a 
+                                              href={task.fileUrl} 
+                                              target="_blank" 
+                                              rel="noopener noreferrer"
+                                              className="text-[10px] font-black text-emerald-600 uppercase tracking-widest hover:underline"
+                                            >
+                                              View
+                                            </a>
+                                            {!isReadOnly && (
+                                              <button
+                                                onClick={() => handleDeleteFile(task.id, task.fileUrl)}
+                                                className="p-1 text-rose-500 hover:bg-rose-100 rounded-lg transition-colors"
+                                                title="Delete file"
+                                              >
+                                                <Trash2 className="w-3.5 h-3.5" />
+                                              </button>
+                                            )}
+                                          </div>
                                         </div>
                                       ) : !isReadOnly && (
                                         <label className="w-full border-2 border-dashed border-slate-200 rounded-2xl py-3 flex flex-col items-center justify-center gap-2 text-slate-400 hover:border-emerald-300 hover:text-emerald-500 transition-all cursor-pointer">
