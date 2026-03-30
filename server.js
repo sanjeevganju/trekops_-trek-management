@@ -19,25 +19,24 @@ const SCOPES = [
   'https://www.googleapis.com/auth/spreadsheets'
 ];
 
+const app = express();
+const isProd = process.env.NODE_ENV === 'production';
+
+// Essential for Vercel/Proxies to handle HTTPS and Cookies correctly
+app.set('trust proxy', 1);
+
+app.use(express.json());
+app.use(cookieSession({
+  name: 'trekops_session',
+  // Ensure we always have a key, even if env var is missing
+  keys: [process.env.SESSION_SECRET || 'trek-ops-permanent-secret-2026-xyz-987'],
+  maxAge: 24 * 60 * 60 * 1000, // 24 hours
+  secure: isProd, 
+  sameSite: 'lax', 
+  httpOnly: true,
+}));
+
 async function startServer() {
-  const app = express();
-  const PORT = 3000;
-
-  // Essential for Vercel/Proxies to handle HTTPS and Cookies correctly
-  app.set('trust proxy', 1);
-
-  const isProd = process.env.NODE_ENV === 'production';
-  
-  app.use(express.json());
-  app.use(cookieSession({
-    name: 'trekops_session',
-    // Ensure we always have a key, even if env var is missing
-    keys: [process.env.SESSION_SECRET || 'trek-ops-permanent-secret-2026-xyz-987'],
-    maxAge: 24 * 60 * 60 * 1000, // 24 hours
-    secure: isProd, 
-    sameSite: 'lax', 
-    httpOnly: true,
-  }));
 
   // Proxy route to bypass CORS for image scanning
   app.get("/api/proxy-image", async (req, res) => {
@@ -243,12 +242,16 @@ async function startServer() {
   });
 
   // Vite middleware for development
-  if (process.env.NODE_ENV !== "production") {
+  if (!isProd) {
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
     });
     app.use(vite.middlewares);
+    const PORT = 3000;
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log(`Server running on http://0.0.0.0:${PORT}`);
+    });
   } else {
     // Serve static files from the 'dist' directory
     const distPath = path.join(process.cwd(), "dist");
@@ -257,10 +260,8 @@ async function startServer() {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
-
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://0.0.0.0:${PORT}`);
-  });
 }
 
 startServer();
+
+export default app;
