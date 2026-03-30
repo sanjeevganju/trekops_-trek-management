@@ -41,7 +41,6 @@ import {
   ChevronDown,
   Shield,
   Lock,
-  ExternalLink,
   Cloud
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
@@ -249,8 +248,6 @@ function TrekOpsApp() {
   };
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isSalesModalOpen, setIsSalesModalOpen] = useState(false);
-  const [isCleanupModalOpen, setIsCleanupModalOpen] = useState(false);
-  const [cleanupData, setCleanupData] = useState<{ duplicates: TrekInstance[], status: 'idle' | 'scanning' | 'found' | 'deleting' | 'done', log: string[] }>({ duplicates: [], status: 'idle', log: [] });
   const [selectedSalesTrips, setSelectedSalesTrips] = useState<string[]>([]);
   const [newTrek, setNewTrek] = useState({ name: '', type: 'Trek' as TrekType, startDate: '', endDate: '', pax: 2, region: 'Nepal', location: '' });
   const [typeFilter, setTypeFilter] = useState<TrekType | 'All'>('All');
@@ -267,7 +264,6 @@ function TrekOpsApp() {
   const [isFirestoreOffline, setIsFirestoreOffline] = useState(false);
   const [isTreksLoading, setIsTreksLoading] = useState(true);
   const [treksError, setTreksError] = useState<string | null>(null);
-  const [showFactoryResetConfirm, setShowFactoryResetConfirm] = useState(false);
   const [uploadingTaskId, setUploadingTaskId] = useState<string | null>(null);
   const [uploadProgress, setUploadProgress] = useState<number>(0);
 
@@ -838,60 +834,6 @@ function TrekOpsApp() {
     }
   };
 
-  const handleFixDatabase = async () => {
-    try {
-      const taskPromises: Promise<any>[] = [];
-      const trekPromises: Promise<any>[] = [];
-      const categories: Category[] = ['Transport', 'Permits', 'Equipment', 'Kitchen', 'Team Assigned', 'Field Accounts'];
-      
-      // Fetch ALL tasks to avoid resetting progress on other treks
-      const allTasksSnapshot = await getDocs(collection(db, 'tasks'));
-      const allTasks = allTasksSnapshot.docs.map(d => d.data() as Task);
-
-      for (const trek of treks) {
-        // Normalize region if needed
-        const normalizedRegion = normalizeRegion(trek.region);
-        if (normalizedRegion !== trek.region) {
-          trekPromises.push(updateDoc(doc(db, 'treks', trek.id), { region: normalizedRegion }));
-        }
-
-        const trekTasks = allTasks.filter(t => t.trekId === trek.id);
-        
-        categories.forEach(category => {
-          const categoryTasks = trekTasks.filter(t => t.category === category);
-          const templates = TASK_TEMPLATES[category] || [];
-          
-          templates.forEach(template => {
-            const exists = categoryTasks.some(t => t.title === template.title);
-            if (!exists) {
-              // Generate Stable ID for tasks: task-[trek-id]-[task-title-slug]
-              const taskNameSlug = template.title.toLowerCase().trim().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
-              const taskStableId = `task-${trek.id}-${taskNameSlug}`;
-
-              taskPromises.push(setDoc(doc(db, 'tasks', taskStableId), {
-                id: taskStableId,
-                trekId: trek.id,
-                category,
-                ...template,
-                status: 'pending',
-                createdAt: serverTimestamp()
-              }));
-            }
-          });
-        });
-      }
-      
-      if (taskPromises.length > 0 || trekPromises.length > 0) {
-        await Promise.all([...taskPromises, ...trekPromises]);
-        setSalesError(`Successfully fixed ${trekPromises.length} regions and added ${taskPromises.length} missing tasks.`);
-      } else {
-        setSalesError('Database is already up to date.');
-      }
-    } catch (error) {
-      handleFirestoreError(error, OperationType.UPDATE, 'database/fix');
-    }
-  };
-
   const deleteTrek = async (trekId: string) => {
     // window.confirm is blocked in the iframe, so we'll proceed directly.
     // In a real app, we'd use a custom modal for this.
@@ -1110,259 +1052,12 @@ function TrekOpsApp() {
     } catch (error: any) {
       console.error('Login Error:', error);
       if (error.code === 'auth/popup-blocked') {
-        alert("The login popup was blocked by your browser. Please allow popups or use the 'Open in New Tab' button below.");
+        alert("The login popup was blocked by your browser. Please allow popups.");
       } else if (error.code === 'auth/cancelled-by-user') {
         // Ignore
       } else {
-        setTreksError(`Login failed: ${error.message}. Try using the 'Open in New Tab' button below.`);
+        setTreksError(`Login failed: ${error.message}.`);
       }
-    }
-  };
-
-  const handleScanDuplicates = () => {
-    console.log('Starting duplicate scan...');
-    setCleanupData({ duplicates: [], status: 'scanning', log: ['Starting scan...'] });
-    setIsCleanupModalOpen(true);
-    
-    setTimeout(() => {
-      const seen = new Map<string, TrekInstance>();
-      const duplicates: TrekInstance[] = [];
-      const logs: string[] = ['Scanning for duplicates...'];
-      
-      console.log(`Current state treks count: ${treks.length}`);
-      if (treks.length > 0) {
-        console.table(treks.map(t => ({ id: t.id, name: t.name, startDate: getTrekDateString(t.startDate) })));
-      }
-
-      const sortedTreks = [...treks].sort((a, b) => {
-        const dateA = parseTrekDate(a.startDate).getTime();
-        const dateB = parseTrekDate(b.startDate).getTime();
-        
-        // Handle invalid dates in sort
-        const timeA = isNaN(dateA) ? 0 : dateA;
-        const timeB = isNaN(dateB) ? 0 : dateB;
-        
-        if (timeA !== timeB) return timeA - timeB;
-        
-        const createA = a.createdAt?.toMillis?.() || 0;
-        const createB = b.createdAt?.toMillis?.() || 0;
-        return createA - createB;
-      });
-
-      console.log(`Scanning ${sortedTreks.length} sorted treks...`);
-
-      sortedTreks.forEach(trek => {
-        const dateStr = getTrekDateString(trek.startDate);
-        const nameKey = trek.name.toLowerCase().trim();
-        
-        // Safety: If name is empty, don't mark as duplicate based on date alone
-        if (!nameKey) {
-          console.log(`Skipping trek with no name: ${trek.id}`);
-          return;
-        }
-
-        const key = `${nameKey}-${dateStr}`;
-        console.log(`Scanning trek: "${trek.name}" ID: ${trek.id} Key: ${key}`);
-        
-        if (seen.has(key)) {
-          const original = seen.get(key);
-          console.log(`Found duplicate: "${trek.name}" (${dateStr}). Keeping ID: ${original?.id}, Marking ID: ${trek.id}`);
-          duplicates.push(trek);
-        } else {
-          console.log(`First encounter: "${trek.name}" (${dateStr}). ID: ${trek.id}`);
-          seen.set(key, trek);
-        }
-      });
-
-      console.log(`Scan complete. Found ${duplicates.length} duplicates. Unique: ${seen.size}`);
-      
-      if (seen.size === 0 && treks.length > 0) {
-        console.error('CRITICAL: Scan resulted in 0 unique treks but input had treks. Aborting.');
-        setCleanupData(prev => ({ 
-          ...prev, 
-          status: 'done', 
-          log: [...logs, 'ERROR: Scan resulted in 0 unique treks. This is a bug in the scan logic. Aborting to prevent data loss.'] 
-        }));
-        return;
-      }
-
-      if (duplicates.length >= treks.length && treks.length > 0) {
-        console.error('CRITICAL: Scan marked ALL treks as duplicates. Aborting.');
-        setCleanupData(prev => ({ 
-          ...prev, 
-          status: 'done', 
-          log: [...logs, `ERROR: Scan marked all ${treks.length} treks as duplicates. This is unsafe. Aborting.`] 
-        }));
-        return;
-      }
-
-      setCleanupData(prev => ({ 
-        ...prev, 
-        duplicates, 
-        status: 'found', 
-        log: [...logs, `Scan complete. Found ${duplicates.length} duplicates out of ${treks.length} total treks.`, `Unique treks to keep: ${seen.size}`] 
-      }));
-    }, 800);
-  };
-
-  const handleExecuteCleanup = async () => {
-    if (cleanupData.status !== 'found' || cleanupData.duplicates.length === 0) return;
-    
-    console.log(`Cleanup execution started. Current treks in state: ${treks.length}`);
-    
-    // FINAL VERIFICATION: Re-run the scan logic on the CURRENT treks state to be 100% safe
-    const seen = new Map<string, TrekInstance>();
-    const finalDuplicates: TrekInstance[] = [];
-    const finalToKeep: TrekInstance[] = [];
-
-    treks.forEach(trek => {
-      const dateStr = getTrekDateString(trek.startDate);
-      const nameKey = trek.name?.trim().toLowerCase();
-      
-      if (!nameKey) {
-        console.warn(`Trek ${trek.id} has no name. Keeping it for safety.`);
-        finalToKeep.push(trek);
-        return;
-      }
-      
-      const key = `${nameKey}-${dateStr}`;
-      
-      if (seen.has(key)) {
-        console.log(`Final check: Marking ${trek.id} ("${trek.name}") as duplicate of ${seen.get(key)?.id}`);
-        finalDuplicates.push(trek);
-      } else {
-        console.log(`Final check: Keeping ${trek.id} ("${trek.name}") as the unique instance.`);
-        seen.set(key, trek);
-        finalToKeep.push(trek);
-      }
-    });
-
-    console.log(`Final Verification Summary: ${finalDuplicates.length} to delete, ${finalToKeep.length} to keep.`);
-
-    if (finalToKeep.length === 0 && treks.length > 0) {
-      const msg = "CRITICAL SAFETY ABORT: Final verification resulted in 0 unique treks. Aborting deletion to prevent data loss.";
-      console.error(msg);
-      setCleanupData(prev => ({ ...prev, log: [...prev.log, `ERROR: ${msg}`], status: 'done' }));
-      return;
-    }
-
-    // Hard limit: Don't delete more than 500 treks in one go
-    if (finalDuplicates.length > 500) {
-      const msg = `Safety limit: Cleanup tried to delete ${finalDuplicates.length} treks. The limit is 500 per run.`;
-      console.error(msg);
-      setCleanupData(prev => ({ ...prev, log: [...prev.log, `ERROR: ${msg}`], status: 'done' }));
-      return;
-    }
-
-    setCleanupData(prev => ({ ...prev, status: 'deleting', log: [...prev.log, `Verified: Deleting ${finalDuplicates.length} duplicates, keeping ${finalToKeep.length} unique treks.`] }));
-    
-    try {
-      const duplicateIds = finalDuplicates.map(t => t.id);
-      console.log('IDs to delete:', duplicateIds);
-      const allTaskRefs: any[] = [];
-      
-      setCleanupData(prev => ({ ...prev, log: [...prev.log, `Step 1: Fetching tasks for ${duplicateIds.length} duplicate treks...`] }));
-      
-      // Fetch tasks in chunks to avoid Firestore limits
-      const chunkedIds = [];
-      for (let i = 0; i < duplicateIds.length; i += 30) {
-        chunkedIds.push(duplicateIds.slice(i, i + 30));
-      }
-
-      for (const chunk of chunkedIds) {
-        const tasksQuery = query(collection(db, 'tasks'), where('trekId', 'in', chunk));
-        const tasksSnapshot = await getDocs(tasksQuery);
-        tasksSnapshot.docs.forEach(d => allTaskRefs.push(d.ref));
-      }
-      
-      setCleanupData(prev => ({ ...prev, log: [...prev.log, `Step 2: Found ${allTaskRefs.length} tasks to remove.`] }));
-
-      const allRefsToDelete = [
-        ...allTaskRefs,
-        ...duplicateIds.map(id => doc(db, 'treks', id))
-      ];
-      console.log(`Total refs to delete: ${allRefsToDelete.length} (${allTaskRefs.length} tasks, ${duplicateIds.length} treks)`);
-
-      const namesToDelete = finalDuplicates.map(t => `"${t.name}" (${getTrekDateString(t.startDate)})`).join(', ');
-      setCleanupData(prev => ({ ...prev, log: [...prev.log, `Step 3: Executing ${allRefsToDelete.length} total delete operations...`, `Deleting: ${namesToDelete.substring(0, 200)}${namesToDelete.length > 200 ? '...' : ''}`] }));
-
-      // Execute in batches of 500 (Firestore limit)
-      let deletedCount = 0;
-      for (let i = 0; i < allRefsToDelete.length; i += 500) {
-        const batch = writeBatch(db);
-        const chunk = allRefsToDelete.slice(i, i + 500);
-        chunk.forEach(ref => batch.delete(ref));
-        await batch.commit();
-        deletedCount += chunk.length;
-        setCleanupData(prev => ({ ...prev, log: [...prev.log, `Batch ${Math.floor(i/500) + 1} complete (${chunk.length} items). Total deleted: ${deletedCount}`] }));
-      }
-
-      setCleanupData(prev => ({ 
-        ...prev, 
-        duplicates: [], 
-        status: 'done', 
-        log: [...prev.log, `SUCCESS: Removed ${duplicateIds.length} treks and ${allTaskRefs.length} tasks.`, `Total unique treks remaining: ${finalToKeep.length}`] 
-      }));
-      
-      // Force a local state update to show results immediately
-      setTreks(finalToKeep);
-      
-      // Reload after a short delay to ensure everything is fresh
-      setTimeout(() => {
-        window.location.reload();
-      }, 2000);
-      
-    } catch (error: any) {
-      console.error('Cleanup Error:', error);
-      const errorMsg = error instanceof Error ? error.message : String(error);
-      setCleanupData(prev => ({ ...prev, log: [...prev.log, `ERROR: ${errorMsg}`], status: 'done' }));
-    }
-  };
-
-  const handleFactoryReset = async () => {
-    // This is a destructive operation.
-    console.log('FACTORY RESET INITIATED');
-    setCleanupData({ duplicates: [], status: 'deleting', log: ['FACTORY RESET INITIATED...', 'Step 1: Fetching ALL treks and tasks from database...'] });
-    setIsCleanupModalOpen(true);
-    
-    try {
-      const treksSnapshot = await getDocs(collection(db, 'treks'));
-      const tasksSnapshot = await getDocs(collection(db, 'tasks'));
-      
-      const allRefs = [
-        ...treksSnapshot.docs.map(d => d.ref),
-        ...tasksSnapshot.docs.map(d => d.ref)
-      ];
-      
-      console.log(`Found ${treksSnapshot.docs.length} treks and ${tasksSnapshot.docs.length} tasks to delete.`);
-      setCleanupData(prev => ({ ...prev, log: [...prev.log, `Found ${treksSnapshot.docs.length} treks and ${tasksSnapshot.docs.length} tasks to delete.`] }));
-      
-      if (allRefs.length === 0) {
-        setCleanupData(prev => ({ ...prev, status: 'done', log: [...prev.log, 'Database is already empty.'] }));
-        return;
-      }
-
-      // Execute in batches of 500
-      let deletedCount = 0;
-      for (let i = 0; i < allRefs.length; i += 500) {
-        const batch = writeBatch(db);
-        const chunk = allRefs.slice(i, i + 500);
-        chunk.forEach(ref => batch.delete(ref));
-        await batch.commit();
-        deletedCount += chunk.length;
-        setCleanupData(prev => ({ ...prev, log: [...prev.log, `Deleted ${deletedCount}/${allRefs.length} items...`] }));
-      }
-      
-      setCleanupData(prev => ({ ...prev, status: 'done', log: [...prev.log, 'FACTORY RESET COMPLETE. Database is now clean.'] }));
-      
-      // Clear local state
-      setTreks([]);
-      setTasks([]);
-      
-      setTimeout(() => window.location.reload(), 2000);
-    } catch (error: any) {
-      console.error('Factory Reset Error:', error);
-      setCleanupData(prev => ({ ...prev, status: 'done', log: [...prev.log, `ERROR: ${error.message}`] }));
     }
   };
 
@@ -1465,15 +1160,6 @@ function TrekOpsApp() {
           <p className="text-xs text-slate-400 mb-4 italic">
             Trouble signing in? Incognito mode or browser settings may block the login window.
           </p>
-          <a 
-            href={window.location.origin}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="inline-flex items-center gap-2 bg-blue-600 text-white font-bold px-6 py-3 rounded-xl shadow-lg shadow-blue-100 hover:bg-blue-700 transition-all animate-pulse"
-          >
-            <ExternalLink className="w-4 h-4" />
-            Open in New Tab to Login
-          </a>
         </div>
       </div>
     );
@@ -1491,15 +1177,6 @@ function TrekOpsApp() {
             <h1 className="text-xl font-bold tracking-tight">TrekOps</h1>
           </div>
           <div className="flex items-center gap-3">
-            <a 
-              href={window.location.origin}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="p-2 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
-              title="Open in New Tab (Fixes Login Issues)"
-            >
-              <ExternalLink className="w-5 h-5" />
-            </a>
             {isAdminMode && (
               <div className="flex items-center gap-2">
                 <button 
@@ -1554,13 +1231,6 @@ function TrekOpsApp() {
               title="Refresh Data"
             >
               <RefreshCw className="w-5 h-5" />
-            </button>
-            <button 
-              onClick={handleScanDuplicates}
-              className="p-2 hover:bg-slate-100 rounded-lg text-slate-400 transition-colors"
-              title="Cleanup Duplicates"
-            >
-              <Trash2 className="w-5 h-5" />
             </button>
             <button 
               onClick={handleLogout}
@@ -1654,19 +1324,10 @@ function TrekOpsApp() {
                     <RefreshCw className="w-3 h-3" />
                   </button>
                   <div className="mt-2 flex flex-col gap-1">
-                    {treks.length === 0 && !treksError ? (
+                    {treks.length === 0 && !treksError && (
                       <button onClick={() => setIsSalesModalOpen(true)} className="text-[10px] text-emerald-600 font-bold underline">
                         Import from Sales
                       </button>
-                    ) : (
-                      <div className="flex flex-col gap-1 items-center">
-                        <button onClick={handleScanDuplicates} className="text-[10px] text-rose-600 font-bold underline opacity-60 hover:opacity-100 transition-opacity">
-                          Cleanup Duplicates
-                        </button>
-                        <button onClick={handleFixDatabase} className="text-[10px] text-emerald-600 font-bold underline opacity-60 hover:opacity-100 transition-opacity">
-                          Fix Regions & Tasks
-                        </button>
-                      </div>
                     )}
                   </div>
                 </div>
@@ -1987,13 +1648,7 @@ function TrekOpsApp() {
                 >
                   {tasks.filter(t => t.category === selectedCategory).length === 0 && (
                     <div className="text-center py-12 bg-white rounded-3xl border border-dashed border-slate-200">
-                      <p className="text-slate-400 text-sm font-medium mb-4">No tasks found in this category.</p>
-                      <button 
-                        onClick={handleFixDatabase}
-                        className="bg-emerald-600 text-white text-[10px] font-bold uppercase tracking-wider px-6 py-3 rounded-xl shadow-lg shadow-emerald-100"
-                      >
-                        Generate Tasks
-                      </button>
+                      <p className="text-slate-400 text-sm font-medium">No tasks found in this category.</p>
                     </div>
                   )}
                   {tasks
@@ -2768,153 +2423,6 @@ function TrekOpsApp() {
         )}
       </AnimatePresence>
 
-      {/* Cleanup Modal */}
-      <AnimatePresence>
-        {isCleanupModalOpen && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} onClick={() => cleanupData.status !== 'deleting' && setIsCleanupModalOpen(false)} className="absolute inset-0 bg-slate-900/40 backdrop-blur-sm" />
-            <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} exit={{ scale: 0.9, opacity: 0 }} className="relative bg-white w-full max-w-sm rounded-3xl shadow-2xl overflow-hidden p-8 text-center">
-              {cleanupData.status === 'scanning' && (
-                <div className="space-y-4">
-                  <div className="w-16 h-16 bg-emerald-100 text-emerald-600 rounded-2xl flex items-center justify-center mx-auto">
-                    <RefreshCw className="w-8 h-8 animate-spin" />
-                  </div>
-                  <h3 className="text-xl font-bold text-slate-800">Scanning for Duplicates</h3>
-                  <p className="text-slate-500 text-sm">Checking your trek list for identical names and dates...</p>
-                </div>
-              )}
-
-              {cleanupData.status === 'found' && (
-                <div className="space-y-6">
-                  <div className="w-16 h-16 bg-amber-100 text-amber-600 rounded-2xl flex items-center justify-center mx-auto">
-                    <AlertCircle className="w-8 h-8" />
-                  </div>
-                  <div>
-                    <h3 className="text-xl font-bold text-slate-800">
-                      {cleanupData.duplicates.length > 0 ? `${cleanupData.duplicates.length} Duplicates Found` : 'No Duplicates Found'}
-                    </h3>
-                    <p className="text-slate-500 text-sm mt-2">
-                      {cleanupData.duplicates.length > 0 
-                        ? 'We found treks with the same name and start date. Would you like to remove them?' 
-                        : 'Your trek list is clean! No identical treks were found.'}
-                    </p>
-                  </div>
-
-                  {cleanupData.duplicates.length > 0 && (
-                    <div className="bg-amber-50 border border-amber-100 rounded-xl p-3 text-left max-h-32 overflow-y-auto">
-                      <p className="text-[10px] font-bold text-amber-800 uppercase mb-2">Preview of Duplicates to Delete (Showing first 50):</p>
-                      {cleanupData.duplicates.slice(0, 50).map((d, i) => (
-                        <p key={i} className="text-[10px] font-mono text-amber-700">
-                          • {d.name} ({getTrekDateString(d.startDate)})
-                        </p>
-                      ))}
-                      {cleanupData.duplicates.length > 20 && (
-                        <p className="text-[10px] font-mono text-amber-700 italic">...and {cleanupData.duplicates.length - 20} more</p>
-                      )}
-                    </div>
-                  )}
-
-                  <div className="flex gap-3">
-                    <button 
-                      onClick={() => setIsCleanupModalOpen(false)}
-                      className="flex-1 px-6 py-3 rounded-xl text-sm font-bold text-slate-400 hover:bg-slate-50 transition-colors"
-                    >
-                      {cleanupData.duplicates.length > 0 ? 'Cancel' : 'Close'}
-                    </button>
-                    {cleanupData.duplicates.length > 0 && (
-                      <button 
-                        onClick={handleExecuteCleanup}
-                        className="flex-1 bg-rose-600 text-white font-bold px-6 py-3 rounded-xl shadow-lg shadow-rose-100 hover:bg-rose-700 transition-all"
-                      >
-                        Delete All
-                      </button>
-                    )}
-                  </div>
-
-                  {/* Danger Zone */}
-                  <div className="pt-4 border-t border-slate-100">
-                    {!showFactoryResetConfirm ? (
-                      <button 
-                        onClick={() => setShowFactoryResetConfirm(true)}
-                        className="text-[10px] font-bold text-rose-400 uppercase tracking-widest hover:text-rose-600 transition-colors"
-                      >
-                        Factory Reset (Wipe All Data)
-                      </button>
-                    ) : (
-                      <div className="space-y-2">
-                        <p className="text-[10px] font-bold text-rose-600 uppercase">Are you absolutely sure? This deletes EVERYTHING.</p>
-                        <div className="flex gap-2">
-                          <button 
-                            onClick={() => setShowFactoryResetConfirm(false)}
-                            className="flex-1 py-2 bg-slate-100 text-slate-600 rounded-lg text-[10px] font-bold uppercase"
-                          >
-                            Cancel
-                          </button>
-                          <button 
-                            onClick={() => {
-                              setShowFactoryResetConfirm(false);
-                              handleFactoryReset();
-                            }}
-                            className="flex-1 py-2 bg-rose-600 text-white rounded-lg text-[10px] font-bold uppercase"
-                          >
-                            Yes, Wipe All
-                          </button>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )}
-
-              {cleanupData.status === 'deleting' && (
-                <div className="space-y-4">
-                  <div className="w-16 h-16 bg-rose-100 text-rose-600 rounded-2xl flex items-center justify-center mx-auto">
-                    <RefreshCw className="w-8 h-8 animate-spin" />
-                  </div>
-                  <h3 className="text-xl font-bold text-slate-800">Removing Duplicates</h3>
-                  <div className="bg-slate-50 rounded-xl p-3 text-left max-h-32 overflow-y-auto">
-                    {cleanupData.log.map((msg, i) => (
-                      <p key={i} className="text-[10px] font-mono text-slate-500">{msg}</p>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {cleanupData.status === 'done' && (
-                <div className="space-y-6">
-                  {cleanupData.log.some(l => l.startsWith('ERROR')) ? (
-                    <div className="w-16 h-16 bg-rose-100 text-rose-600 rounded-2xl flex items-center justify-center mx-auto">
-                      <AlertTriangle className="w-8 h-8" />
-                    </div>
-                  ) : (
-                    <div className="w-16 h-16 bg-emerald-100 text-emerald-600 rounded-2xl flex items-center justify-center mx-auto">
-                      <CheckCircle2 className="w-8 h-8" />
-                    </div>
-                  )}
-                  <div>
-                    <h3 className="text-xl font-bold text-slate-800">
-                      {cleanupData.log.some(l => l.startsWith('ERROR')) ? 'Cleanup Aborted' : 'Cleanup Complete'}
-                    </h3>
-                    <div className="bg-slate-50 rounded-xl p-3 text-left mb-4">
-                      {cleanupData.log.slice(-5).map((msg, i) => (
-                        <p key={i} className={`text-[10px] font-mono ${msg.startsWith('ERROR') ? 'text-rose-600 font-bold' : 'text-slate-500'}`}>
-                          {msg}
-                        </p>
-                      ))}
-                    </div>
-                  </div>
-                  <button 
-                    onClick={() => setIsCleanupModalOpen(false)}
-                    className="w-full bg-slate-900 text-white font-bold px-6 py-3 rounded-xl hover:bg-slate-800 transition-all"
-                  >
-                    Back to Dashboard
-                  </button>
-                </div>
-              )}
-            </motion.div>
-          </div>
-        )}
-      </AnimatePresence>
       <AnimatePresence>
         {isSalesModalOpen && (
           <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-4">
