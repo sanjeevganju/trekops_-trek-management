@@ -23,6 +23,9 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
+  // Essential for Vercel/Proxies to handle HTTPS and Cookies correctly
+  app.set('trust proxy', 1);
+
   const isProd = process.env.NODE_ENV === 'production';
   
   app.use(express.json());
@@ -30,8 +33,8 @@ async function startServer() {
     name: 'trekops_session',
     keys: [process.env.SESSION_SECRET || 'trek-ops-secret-key-2026'],
     maxAge: 24 * 60 * 60 * 1000, // 24 hours
-    secure: isProd, // True on Vercel (HTTPS), false on local dev
-    sameSite: isProd ? 'none' : 'lax', 
+    secure: isProd, 
+    sameSite: 'lax', // Changed from 'none' to 'lax' for better Vercel compatibility
     httpOnly: true,
   }));
 
@@ -59,15 +62,13 @@ async function startServer() {
   // Google OAuth Routes
   app.get("/api/auth/google/url", (req, res) => {
     // Use the APP_URL provided by the environment, fallback to request headers
-    const protocol = req.headers['x-forwarded-proto'] || 'http';
-    const host = req.headers['x-forwarded-host'] || req.headers.host;
-    const appUrl = process.env.APP_URL || `${protocol}://${host}`;
+    const appUrl = process.env.APP_URL || `${req.protocol}://${req.get('host')}`;
     const redirectUri = `${appUrl.replace(/\/$/, "")}/api/auth/google/callback`;
     
     console.log("Generating OAuth URL with redirectUri:", redirectUri);
     console.log("APP_URL env:", process.env.APP_URL);
-    console.log("X-Forwarded-Host:", req.headers['x-forwarded-host']);
-    console.log("Host header:", req.headers.host);
+    console.log("Protocol:", req.protocol);
+    console.log("Host:", req.get('host'));
     
     const url = oauth2Client.generateAuthUrl({
       access_type: 'offline',
@@ -80,10 +81,9 @@ async function startServer() {
 
   app.get("/api/auth/google/callback", async (req, res) => {
     const { code } = req.query;
-    const protocol = req.headers['x-forwarded-proto'] || 'http';
-    const host = req.headers['x-forwarded-host'] || req.headers.host;
-    const appUrl = process.env.APP_URL || `${protocol}://${host}`;
+    const appUrl = process.env.APP_URL || `${req.protocol}://${req.get('host')}`;
     const redirectUri = `${appUrl.replace(/\/$/, "")}/api/auth/google/callback`;
+    console.log("Handling OAuth callback with redirect:", redirectUri);
 
     try {
       const { tokens } = await oauth2Client.getToken({
