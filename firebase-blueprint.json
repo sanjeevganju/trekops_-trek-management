@@ -32,7 +32,8 @@
         "isNA": { "type": "boolean", "description": "Whether the task is Not Applicable" },
         "subtasks": { "type": "array", "description": "List of subtasks or additional details" },
         "completedAt": { "type": "string", "format": "date-time", "description": "When the task was completed" },
-        "completedBy": { "type": "string", "description": "User ID who completed the task" }
+        "completedBy": { "type": "string", "description": "User ID who completed the task" },
+        "isScanned": { "type": "boolean", "description": "Whether the task has been scanned by AI" }
       },
       "required": ["trekId", "category", "title", "status"]
     },
@@ -47,11 +48,27 @@
         "email": { "type": "string", "format": "email", "description": "Email address" }
       },
       "required": ["uid", "name", "role", "email"]
+    },
+    "ExtractedList": {
+      "title": "Extracted List",
+      "description": "Data extracted from an image by AI",
+      "type": "object",
+      "properties": {
+        "taskId": { "type": "string", "description": "ID of the task" },
+        "trekId": { "type": "string", "description": "ID of the trek" },
+        "trekName": { "type": "string", "description": "Name of the trek" },
+        "taskTitle": { "type": "string", "description": "Title of the task" },
+        "data": { "type": "array", "description": "The extracted items, quantities, and prices" },
+        "scannedAt": { "type": "string", "format": "date-time", "description": "When the scan was performed" },
+        "scannedBy": { "type": "string", "description": "Email of the user who performed the scan" }
+      },
+      "required": ["taskId", "data", "scannedAt"]
     }
   },
   "firestore": {
     "/treks": { "schema": "Trek", "description": "Collection of all treks" },
     "/tasks": { "schema": "Task", "description": "Collection of all tasks across all treks" },
-    "/team": { "schema": "TeamMember", "description": "Collection of team members" }
+    "/team": { "schema": "TeamMember", "description": "Collection of team members" },
+    "/extracted_lists": { "schema": "ExtractedList", "description": "Collection of AI extracted data" }
   }
 }

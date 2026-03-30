@@ -92,7 +92,8 @@ service cloud.firestore {
              data.title is string && data.title.size() > 0 && data.title.size() < 200 &&
              data.status in ['pending', 'completed'] &&
              data.type in ['number', 'text', 'file', 'select', 'amount'] &&
-             (!('subtasks' in data) || data.subtasks is list);
+             (!('subtasks' in data) || data.subtasks is list) &&
+             (!('isScanned' in data) || data.isScanned is bool);
     }
 
     function isValidTeamMember(data) {
@@ -100,6 +101,12 @@ service cloud.firestore {
              data.name is string && data.name.size() > 0 && data.name.size() < 100 &&
              data.role in ['Ground Ops', 'Support', 'Trip Leader', 'Head Office'] &&
              data.email is string;
+    }
+
+    function isValidExtractedList(data) {
+      return data.taskId is string &&
+             data.data is list &&
+             data.scannedAt is timestamp;
     }
 
     // ===============================================================
@@ -124,6 +131,13 @@ service cloud.firestore {
       allow read: if isAuthenticated();
       allow create: if isAuthenticated() && (isOwner(userId) || isAdmin()) && isValidTeamMember(request.resource.data);
       allow update: if isAuthenticated() && (isOwner(userId) || isAdmin()) && isValidTeamMember(request.resource.data);
+    }
+
+    match /extracted_lists/{listId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && isValidExtractedList(request.resource.data);
+      allow update: if isAdmin();
+      allow delete: if isAdmin();
     }
   }
 }

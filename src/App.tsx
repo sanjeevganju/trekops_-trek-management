@@ -38,7 +38,11 @@ import {
   Trash2,
   Upload,
   Check,
-  ChevronDown
+  ChevronDown,
+  Shield,
+  Lock,
+  ExternalLink,
+  Cloud
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
@@ -56,7 +60,8 @@ import {
   deleteDoc,
   writeBatch,
   getDocs,
-  setDoc
+  setDoc,
+  limit
 } from 'firebase/firestore';
 import { 
   signInWithPopup, 
@@ -71,6 +76,7 @@ import {
   getDownloadURL,
   deleteObject
 } from 'firebase/storage';
+import { GoogleGenAI, Type } from "@google/genai";
 import { db, auth, storage } from './firebase';
 import { TASK_TEMPLATES, TrekType, Category, TaskTemplate, REGIONS } from './constants';
 import { formatDate, formatDeadline, isOverdue } from './utils';
@@ -200,6 +206,7 @@ interface Task {
   options?: string[];
   subtasks?: any[];
   contact?: string;
+  isScanned?: boolean;
 }
 
 interface TrekInstance {
@@ -226,6 +233,20 @@ function TrekOpsApp() {
   const [selectedCategory, setSelectedCategory] = useState<Category | null>(null);
   const [treks, setTreks] = useState<TrekInstance[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
+
+  const getTrekProgress = (trekId: string) => {
+    const trekTasks = tasks.filter(t => t.trekId === trekId);
+    if (trekTasks.length === 0) return { percent: 0, color: 'bg-rose-500' };
+    
+    const completedTasks = trekTasks.filter(t => t.status === 'completed' || t.isNA).length;
+    const percent = Math.round((completedTasks / trekTasks.length) * 100);
+    
+    if (percent === 100) return { percent, color: 'bg-emerald-500' };
+    if (percent >= 75) return { percent, color: 'bg-blue-500' };
+    if (percent >= 50) return { percent, color: 'bg-yellow-400' };
+    if (percent >= 25) return { percent, color: 'bg-orange-500' };
+    return { percent, color: 'bg-rose-500' };
+  };
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isSalesModalOpen, setIsSalesModalOpen] = useState(false);
   const [isCleanupModalOpen, setIsCleanupModalOpen] = useState(false);
@@ -250,6 +271,120 @@ function TrekOpsApp() {
   const [uploadingTaskId, setUploadingTaskId] = useState<string | null>(null);
   const [uploadProgress, setUploadProgress] = useState<number>(0);
 
+  const [isAdminMode, setIsAdminMode] = useState(false);
+  const [isAdminModalOpen, setIsAdminModalOpen] = useState(false);
+  const [adminPasscode, setAdminPasscode] = useState('');
+  const [adminPasscodeError, setAdminPasscodeError] = useState(false);
+
+  const [isScanning, setIsScanning] = useState(false);
+  const [scanResults, setScanResults] = useState<any[] | null>(null);
+  const [scanError, setScanError] = useState<string | null>(null);
+  const [isScanModalOpen, setIsScanModalOpen] = useState(false);
+  const [scanningTask, setScanningTask] = useState<Task | null>(null);
+  const [isGoogleConnected, setIsGoogleConnected] = useState(false);
+
+  useEffect(() => {
+    checkGoogleStatus();
+    
+    const handleMessage = (event: MessageEvent) => {
+      console.log('Received message from popup:', event.data);
+      if (event.data?.type === 'OAUTH_AUTH_SUCCESS') {
+        console.log('OAuth success message received, checking status...');
+        checkGoogleStatus();
+      }
+    };
+    window.addEventListener('message', handleMessage);
+    return () => window.removeEventListener('message', handleMessage);
+  }, []);
+
+  const [isRefreshingStatus, setIsRefreshingStatus] = useState(false);
+
+  const checkGoogleStatus = async () => {
+    setIsRefreshingStatus(true);
+    console.log('Manually checking Google status...');
+    try {
+      const res = await fetch('/api/google/status', { credentials: 'include' });
+      const data = await res.json();
+      console.log('Google status check result:', data);
+      setIsGoogleConnected(data.connected);
+      return data.connected;
+    } catch (error) {
+      console.error("Failed to check Google status:", error);
+      return false;
+    } finally {
+      // Keep the spin for at least 500ms so it's visible
+      setTimeout(() => setIsRefreshingStatus(false), 500);
+    }
+  };
+
+  const handleConnectGoogle = async () => {
+    try {
+      const res = await fetch('/api/auth/google/url', { credentials: 'include' });
+      const { url } = await res.json();
+      window.open(url, 'google_oauth', 'width=600,height=700');
+      
+      // Start polling for status since postMessage can be unreliable in some browsers
+      let attempts = 0;
+      const interval = setInterval(async () => {
+        attempts++;
+        const connected = await checkGoogleStatus();
+        if (connected || attempts > 20) {
+          clearInterval(interval);
+        }
+      }, 2000);
+    } catch (error) {
+      console.error("Failed to get Google auth URL:", error);
+    }
+  };
+
+  const handleSyncToSheets = async (task: Task) => {
+    if (!isGoogleConnected || !selectedTrek) return;
+    
+    try {
+      setIsScanning(true);
+      // Fetch the extracted data from Firestore for this task
+      const q = query(
+        collection(db, 'extracted_lists'), 
+        where('taskId', '==', task.id),
+        orderBy('scannedAt', 'desc'),
+        limit(1)
+      );
+      const querySnapshot = await getDocs(q);
+      
+      if (querySnapshot.empty) {
+        alert("No extracted data found for this task in the database. Please scan it first.");
+        return;
+      }
+
+      const extractedData = querySnapshot.docs[0].data();
+      
+      const res = await fetch('/api/google/save-list', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({
+          trekName: selectedTrek.name,
+          taskTitle: task.title,
+          data: extractedData.data
+        })
+      });
+
+      if (res.ok) {
+        alert("Successfully synced to Google Sheets!");
+      } else {
+        const error = await res.json();
+        throw new Error(error.error || "Failed to sync to Google Sheets");
+      }
+    } catch (error: any) {
+      console.error("Sync error:", error);
+      alert(`Sync failed: ${error.message}`);
+    } finally {
+      setIsScanning(false);
+    }
+  };
+
+  const ADMIN_PASSCODE = "1234"; // Static passcode as requested
+
   // --- Error Handling ---
   useEffect(() => {
     const handleError = (event: ErrorEvent) => {
@@ -257,8 +392,15 @@ function TrekOpsApp() {
       setTreksError(`Runtime Error: ${event.error?.message || 'Unknown error'}`);
     };
     const handleRejection = (event: PromiseRejectionEvent) => {
+      const reason = event.reason?.message || String(event.reason);
       console.error('Unhandled Rejection:', event.reason);
-      setTreksError(`Promise Rejection: ${event.reason?.message || String(event.reason)}`);
+      
+      // Ignore common environment-related WebSocket errors that are benign
+      if (reason.includes('WebSocket') || reason.includes('HMR')) {
+        return;
+      }
+      
+      setTreksError(`Promise Rejection: ${reason}`);
     };
     window.addEventListener('error', handleError);
     window.addEventListener('unhandledrejection', handleRejection);
@@ -575,6 +717,153 @@ function TrekOpsApp() {
     }
   };
 
+  const handleAdminAuth = () => {
+    if (adminPasscode === ADMIN_PASSCODE) {
+      setIsAdminMode(true);
+      setIsAdminModalOpen(false);
+      setAdminPasscode('');
+      setAdminPasscodeError(false);
+    } else {
+      setAdminPasscodeError(true);
+      setAdminPasscode('');
+    }
+  };
+
+  const handleScanAndSave = async (task: Task) => {
+    if (!task.fileUrl) return;
+    
+    setIsScanning(true);
+    setScanningTask(task);
+    setScanResults(null);
+    setScanError(null);
+    setIsScanModalOpen(true);
+
+    try {
+      // 1. Fetch the image via proxy to bypass CORS
+      const proxyUrl = `/api/proxy-image?url=${encodeURIComponent(task.fileUrl)}`;
+      const response = await fetch(proxyUrl);
+      if (!response.ok) throw new Error('Failed to fetch image via proxy. This might be a connection issue.');
+      
+      const blob = await response.blob();
+      const base64Data = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = () => resolve((reader.result as string).split(',')[1]);
+        reader.onerror = () => reject(new Error('Failed to read image file.'));
+        reader.readAsDataURL(blob);
+      });
+
+      // 2. Initialize Gemini
+      if (!process.env.GEMINI_API_KEY) {
+        throw new Error('Gemini API Key is missing. Please check your environment variables.');
+      }
+      
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      
+      // 3. Call Gemini to extract data
+      const result = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: [
+          {
+            parts: [
+              { text: "Extract the items, quantities, and any prices from this list. Return the data as a JSON array of objects with keys: 'item' (string), 'quantity' (string), and 'unit_price' (number, optional). If a price is not found, omit the key. Focus on making the list clean and readable." },
+              { inlineData: { data: base64Data, mimeType: blob.type } }
+            ]
+          }
+        ],
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                item: { type: Type.STRING },
+                quantity: { type: Type.STRING },
+                unit_price: { type: Type.NUMBER }
+              },
+              required: ["item", "quantity"]
+            }
+          }
+        }
+      });
+
+      if (!result.text) {
+        throw new Error('Gemini returned an empty response. The image might be too blurry or contain no readable text.');
+      }
+
+      const extracted = JSON.parse(result.text);
+      if (!Array.isArray(extracted) || extracted.length === 0) {
+        throw new Error('No items were found in the image.');
+      }
+      
+      setScanResults(extracted);
+    } catch (error: any) {
+      console.error('Scanning error:', error);
+      setScanError(error.message || 'An unexpected error occurred during scanning.');
+    } finally {
+      setIsScanning(false);
+    }
+  };
+
+  const handleConfirmScan = async () => {
+    if (!scanningTask || !scanResults) return;
+
+    try {
+      setIsScanning(true); // Re-use scanning state for saving indicator
+      // Save the extracted data to a new collection in Firestore
+      // For now, we'll save it under 'extracted_lists' linked to the task
+      await addDoc(collection(db, 'extracted_lists'), {
+        taskId: scanningTask.id,
+        trekId: selectedTrek?.id,
+        trekName: selectedTrek?.name,
+        taskTitle: scanningTask.title,
+        data: scanResults,
+        scannedAt: serverTimestamp(),
+        scannedBy: user?.email
+      });
+
+      // Also update the task to indicate it has been scanned
+      await updateTaskValue(scanningTask.id, 'isScanned', true);
+      
+      // Save to Google Sheets if connected
+      if (isGoogleConnected) {
+        try {
+          await fetch('/api/google/save-list', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              trekName: selectedTrek?.name,
+              taskTitle: scanningTask.title,
+              data: scanResults
+            })
+          });
+        } catch (err) {
+          console.error("Failed to save to Google Sheets:", err);
+          // We don't block the UI if Sheets fails, as Firestore succeeded
+        }
+      }
+      
+      if (isGoogleConnected) {
+        alert("Successfully saved to Database and synced to Google Sheets!");
+      } else {
+        alert("Successfully saved to Database!");
+      }
+
+      setIsScanModalOpen(false);
+      setScanResults(null);
+      setScanningTask(null);
+      setScanError(null);
+      
+      // Use a custom toast or just close the modal. 
+      // The user will see the task updated in the list.
+    } catch (error: any) {
+      console.error('Error saving scan results:', error);
+      setScanError(error.message || 'Failed to save extracted data to Firestore.');
+    } finally {
+      setIsScanning(false);
+    }
+  };
+
   const handleFixDatabase = async () => {
     try {
       const taskPromises: Promise<any>[] = [];
@@ -841,9 +1130,18 @@ function TrekOpsApp() {
   const handleLogin = async () => {
     try {
       const provider = new GoogleAuthProvider();
+      // Force account selection to help with multi-account issues
+      provider.setCustomParameters({ prompt: 'select_account' });
       await signInWithPopup(auth, provider);
-    } catch (error) {
+    } catch (error: any) {
       console.error('Login Error:', error);
+      if (error.code === 'auth/popup-blocked') {
+        alert("The login popup was blocked by your browser. Please allow popups or use the 'Open in New Tab' button below.");
+      } else if (error.code === 'auth/cancelled-by-user') {
+        // Ignore
+      } else {
+        setTreksError(`Login failed: ${error.message}. Try using the 'Open in New Tab' button below.`);
+      }
     }
   };
 
@@ -1183,11 +1481,26 @@ function TrekOpsApp() {
         <p className="text-slate-500 mb-10 max-w-xs">Manage your trekking operations with precision and ease.</p>
         <button 
           onClick={handleLogin}
-          className="flex items-center gap-3 bg-white border border-slate-200 text-slate-700 font-bold px-8 py-4 rounded-2xl shadow-sm hover:shadow-md transition-all active:scale-[0.98]"
+          className="flex items-center gap-3 bg-white border border-slate-200 text-slate-700 font-bold px-8 py-4 rounded-2xl shadow-sm hover:shadow-md transition-all active:scale-[0.98] mb-6"
         >
           <LogIn className="w-5 h-5 text-emerald-600" />
           Sign in with Google
         </button>
+
+        <div className="max-w-xs text-center">
+          <p className="text-xs text-slate-400 mb-4 italic">
+            Trouble signing in? Incognito mode or browser settings may block the login window.
+          </p>
+          <a 
+            href={window.location.origin}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-2 bg-blue-600 text-white font-bold px-6 py-3 rounded-xl shadow-lg shadow-blue-100 hover:bg-blue-700 transition-all animate-pulse"
+          >
+            <ExternalLink className="w-4 h-4" />
+            Open in New Tab to Login
+          </a>
+        </div>
       </div>
     );
   }
@@ -1204,6 +1517,63 @@ function TrekOpsApp() {
             <h1 className="text-xl font-bold tracking-tight">TrekOps</h1>
           </div>
           <div className="flex items-center gap-3">
+            <a 
+              href={window.location.origin}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="p-2 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
+              title="Open in New Tab (Fixes Login Issues)"
+            >
+              <ExternalLink className="w-5 h-5" />
+            </a>
+            {isAdminMode && (
+              <div className="flex items-center gap-2">
+                <button 
+                  onClick={checkGoogleStatus}
+                  className="p-2 text-slate-400 hover:text-emerald-600 hover:bg-emerald-50 rounded-lg transition-colors"
+                  title="Refresh Connection Status"
+                >
+                  <RefreshCw className={`w-4 h-4 ${isRefreshingStatus ? 'animate-spin' : ''}`} />
+                </button>
+                <button 
+                  onClick={handleConnectGoogle}
+                  className={`px-3 py-2 rounded-xl transition-all flex items-center gap-2 border shadow-sm ${
+                    isGoogleConnected 
+                      ? 'bg-emerald-50 border-emerald-200 text-emerald-600 hover:bg-emerald-100' 
+                      : 'bg-white border-slate-200 text-slate-700 hover:border-emerald-400 hover:bg-emerald-50/30'
+                  }`}
+                  title={isGoogleConnected ? "Google Drive Connected" : "Connect Google Drive"}
+                >
+                  <div className="w-5 h-5 flex items-center justify-center bg-white rounded-lg shadow-sm border border-slate-100">
+                    <Cloud className="w-3.5 h-3.5 text-blue-500" />
+                  </div>
+                  <span className="text-[10px] font-bold uppercase tracking-widest hidden sm:inline">
+                    {isGoogleConnected ? "Connected" : "Connect Drive"}
+                  </span>
+                </button>
+                {isGoogleConnected && (
+                  <button 
+                    onClick={async () => {
+                      if(confirm("Disconnect Google Drive?")) {
+                        await fetch('/api/google/logout', { method: 'POST' });
+                        checkGoogleStatus();
+                      }
+                    }}
+                    className="p-2 text-slate-400 hover:text-rose-500 hover:bg-rose-50 rounded-lg transition-colors"
+                    title="Disconnect Google Drive"
+                  >
+                    <LogOut className="w-4 h-4" />
+                  </button>
+                )}
+              </div>
+            )}
+            <button 
+              onClick={() => isAdminMode ? setIsAdminMode(false) : setIsAdminModalOpen(true)}
+              className={`p-2 rounded-lg transition-colors ${isAdminMode ? 'bg-emerald-100 text-emerald-600' : 'hover:bg-slate-100 text-slate-400'}`}
+              title={isAdminMode ? "Exit Admin Mode" : "Admin Mode"}
+            >
+              <Shield className="w-5 h-5" />
+            </button>
             <button 
               onClick={() => window.location.reload()}
               className="p-2 hover:bg-slate-100 rounded-lg text-slate-400 transition-colors"
@@ -1248,6 +1618,12 @@ function TrekOpsApp() {
                 </div>
                 <h2 className="text-2xl font-bold">Trek Task Manager</h2>
                 <p className="text-emerald-100 text-sm opacity-80">Select Your Base</p>
+                {isAdminMode && (
+                  <div className="mt-2 inline-flex items-center gap-1.5 bg-white/20 px-3 py-1 rounded-full border border-white/30">
+                    <Shield className="w-3 h-3" />
+                    <span className="text-[10px] font-black uppercase tracking-widest">Admin Mode Active</span>
+                  </div>
+                )}
               </div>
 
               {/* Treks Loading/Error Display */}
@@ -1469,18 +1845,24 @@ function TrekOpsApp() {
                     key={trek.id}
                     whileTap={{ scale: 0.98 }}
                     onClick={() => { setSelectedTrek(trek); setView('trek-details'); }}
-                    className="bg-white p-5 rounded-3xl border border-slate-100 shadow-sm flex items-center justify-between group cursor-pointer"
+                    className="bg-white p-5 rounded-3xl border border-slate-100 shadow-sm flex items-center justify-between group cursor-pointer relative"
                   >
-                    <div className="flex items-center gap-4">
-                      <div className={`p-3 rounded-2xl ${
+                    {/* Progress Indicator Dot - Top Right */}
+                    <div 
+                      className={`absolute top-4 right-4 w-2 h-2 rounded-full ${getTrekProgress(trek.id).color} shadow-sm flex-shrink-0`} 
+                      title={`${getTrekProgress(trek.id).percent}% complete`} 
+                    />
+
+                    <div className="flex items-center gap-4 pr-6">
+                      <div className={`p-3 rounded-2xl flex-shrink-0 ${
                         trek.type === 'Expedition' ? 'bg-amber-50 text-amber-600' : 
                         trek.type === 'Climb' ? 'bg-rose-50 text-rose-600' : 'bg-emerald-50 text-emerald-600'
                       }`}>
                         <Mountain className="w-6 h-6" />
                       </div>
                       <div>
-                        <h3 className="font-bold text-slate-800 text-lg">{trek.name}</h3>
-                        <div className="flex items-center gap-3 mt-1">
+                        <h3 className="font-bold text-slate-800 text-lg leading-tight">{trek.name}</h3>
+                        <div className="flex items-center gap-3 mt-1.5">
                           <div className="flex items-center gap-1 text-slate-400 text-[10px] font-bold uppercase">
                             <Calendar className="w-3 h-3" />
                             <span>{formatDate(trek.startDate)}</span>
@@ -1894,25 +2276,45 @@ function TrekOpsApp() {
                                                 <FileText className="w-4 h-4" />
                                                 <span className="text-xs font-bold truncate max-w-[150px]">Voucher Uploaded</span>
                                               </div>
-                                              <div className="flex items-center gap-3">
-                                                <a 
-                                                  href={task.fileUrl} 
-                                                  target="_blank" 
-                                                  rel="noopener noreferrer"
-                                                  className="text-[10px] font-black text-emerald-600 uppercase tracking-widest hover:underline"
-                                                >
-                                                  View
-                                                </a>
-                                                {!isReadOnly && (
-                                                  <button
-                                                    onClick={() => handleDeleteFile(task.id, task.fileUrl)}
-                                                    className="p-1 text-rose-500 hover:bg-rose-100 rounded-lg transition-colors"
-                                                    title="Delete file"
-                                                  >
-                                                    <Trash2 className="w-3.5 h-3.5" />
-                                                  </button>
-                                                )}
-                                              </div>
+                                                  <div className="flex items-center gap-3">
+                                                    {task.isScanned && isGoogleConnected && isAdminMode && (
+                                                      <button
+                                                        onClick={() => handleSyncToSheets(task)}
+                                                        className="flex items-center gap-1 px-2 py-1 bg-blue-600 text-white rounded-lg text-[9px] font-black uppercase tracking-wider hover:bg-blue-700 transition-colors shadow-sm"
+                                                        title="Sync to Google Sheets"
+                                                      >
+                                                        <RefreshCw className={`w-3 h-3 ${isScanning ? 'animate-spin' : ''}`} />
+                                                        Sync
+                                                      </button>
+                                                    )}
+                                                    {isAdminMode && (
+                                                      <button
+                                                        onClick={() => handleScanAndSave(task)}
+                                                        className="flex items-center gap-1 px-2 py-1 bg-emerald-600 text-white rounded-lg text-[9px] font-black uppercase tracking-wider hover:bg-emerald-700 transition-colors shadow-sm"
+                                                        title="AI Scan & Save"
+                                                      >
+                                                        <TrendingUp className="w-3 h-3" />
+                                                        Scan
+                                                      </button>
+                                                    )}
+                                                    <a 
+                                                      href={task.fileUrl} 
+                                                      target="_blank" 
+                                                      rel="noopener noreferrer"
+                                                      className="text-[10px] font-black text-emerald-600 uppercase tracking-widest hover:underline"
+                                                    >
+                                                      View
+                                                    </a>
+                                                    {!isReadOnly && (
+                                                      <button
+                                                        onClick={() => handleDeleteFile(task.id, task.fileUrl)}
+                                                        className="p-1 text-rose-500 hover:bg-rose-100 rounded-lg transition-colors"
+                                                        title="Delete file"
+                                                      >
+                                                        <Trash2 className="w-3.5 h-3.5" />
+                                                      </button>
+                                                    )}
+                                                  </div>
                                             </div>
                                           ) : (
                                             <label className="w-full border-2 border-dashed border-slate-200 rounded-2xl py-3 flex flex-col items-center justify-center gap-2 text-slate-400 hover:border-emerald-300 hover:text-emerald-500 transition-all cursor-pointer">
@@ -1949,6 +2351,32 @@ function TrekOpsApp() {
                                             <span className="text-xs font-bold truncate max-w-[150px]">File Uploaded</span>
                                           </div>
                                           <div className="flex items-center gap-3">
+                                            {task.isScanned && isGoogleConnected && isAdminMode && (
+                                              <button
+                                                onClick={() => handleSyncToSheets(task)}
+                                                className="flex items-center gap-1 px-2 py-1 bg-blue-600 text-white rounded-lg text-[9px] font-black uppercase tracking-wider hover:bg-blue-700 transition-colors shadow-sm"
+                                                title="Sync to Google Sheets"
+                                              >
+                                                <RefreshCw className={`w-3 h-3 ${isScanning ? 'animate-spin' : ''}`} />
+                                                Sync
+                                              </button>
+                                            )}
+                                            {task.isScanned && (
+                                              <div className="flex items-center gap-1 px-2 py-1 bg-blue-100 text-blue-700 rounded-lg text-[9px] font-black uppercase tracking-wider border border-blue-200">
+                                                <CheckCircle2 className="w-3 h-3" />
+                                                Scanned
+                                              </div>
+                                            )}
+                                            {isAdminMode && (
+                                              <button
+                                                onClick={() => handleScanAndSave(task)}
+                                                className="flex items-center gap-1 px-2 py-1 bg-emerald-600 text-white rounded-lg text-[9px] font-black uppercase tracking-wider hover:bg-emerald-700 transition-colors shadow-sm"
+                                                title="AI Scan & Save"
+                                              >
+                                                <TrendingUp className="w-3 h-3" />
+                                                Scan
+                                              </button>
+                                            )}
                                             <a 
                                               href={task.fileUrl} 
                                               target="_blank" 
@@ -2094,6 +2522,219 @@ function TrekOpsApp() {
           )}
         </AnimatePresence>
       </main>
+
+      {/* Admin Passcode Modal */}
+      <AnimatePresence>
+        {isAdminModalOpen && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setIsAdminModalOpen(false)}
+              className="absolute inset-0 bg-slate-900/60 backdrop-blur-sm"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.9, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.9, y: 20 }}
+              className="relative w-full max-w-xs bg-white rounded-[2.5rem] shadow-2xl overflow-hidden p-8"
+            >
+              <div className="flex flex-col items-center text-center space-y-4">
+                <div className="w-16 h-16 bg-emerald-50 rounded-3xl flex items-center justify-center text-emerald-600 mb-2">
+                  <Lock className="w-8 h-8" />
+                </div>
+                <div>
+                  <h3 className="text-xl font-bold text-slate-800">Admin Access</h3>
+                  <p className="text-xs font-bold text-slate-400 uppercase tracking-widest mt-1">Enter Passcode</p>
+                </div>
+                
+                <div className="w-full space-y-4 pt-4">
+                  <div className="relative">
+                    <input 
+                      type="password"
+                      value={adminPasscode}
+                      onChange={(e) => {
+                        setAdminPasscode(e.target.value);
+                        setAdminPasscodeError(false);
+                      }}
+                      onKeyDown={(e) => e.key === 'Enter' && handleAdminAuth()}
+                      placeholder="••••"
+                      className={`w-full bg-slate-50 border-2 rounded-2xl px-6 py-4 text-center text-2xl tracking-[1em] font-bold outline-none transition-all ${
+                        adminPasscodeError ? 'border-rose-200 text-rose-500 animate-shake' : 'border-slate-100 focus:border-emerald-500 text-slate-800'
+                      }`}
+                      autoFocus
+                    />
+                    {adminPasscodeError && (
+                      <p className="text-[10px] font-bold text-rose-500 uppercase tracking-widest mt-2">Incorrect Passcode</p>
+                    )}
+                  </div>
+
+                  <div className="flex gap-3 pt-2">
+                    <button 
+                      onClick={() => setIsAdminModalOpen(false)}
+                      className="flex-1 py-4 text-sm font-bold text-slate-400 hover:bg-slate-50 rounded-2xl transition-colors"
+                    >
+                      Cancel
+                    </button>
+                    <button 
+                      onClick={handleAdminAuth}
+                      className="flex-1 bg-emerald-600 text-white font-bold py-4 rounded-2xl shadow-lg shadow-emerald-100 active:scale-[0.98] transition-all"
+                    >
+                      Verify
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Scan Results Modal */}
+      <AnimatePresence>
+        {isScanModalOpen && (
+          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => !isScanning && setIsScanModalOpen(false)}
+              className="absolute inset-0 bg-slate-900/60 backdrop-blur-sm"
+            />
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.9, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.9, y: 20 }}
+              className="relative w-full max-w-lg bg-white rounded-[2.5rem] shadow-2xl overflow-hidden flex flex-col max-h-[85vh]"
+            >
+              <div className="p-8 border-b border-slate-100 shrink-0">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    <div className="w-12 h-12 bg-emerald-50 rounded-2xl flex items-center justify-center text-emerald-600">
+                      <TrendingUp className="w-6 h-6" />
+                    </div>
+                    <div>
+                      <h3 className="text-xl font-bold text-slate-800">AI Data Extraction</h3>
+                      <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mt-0.5">Scanning: {scanningTask?.title}</p>
+                    </div>
+                  </div>
+                  {!isScanning && (
+                    <button 
+                      onClick={() => setIsScanModalOpen(false)}
+                      className="p-2 hover:bg-slate-100 rounded-full text-slate-400 transition-colors"
+                    >
+                      <X className="w-6 h-6" />
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              <div className="flex-1 overflow-y-auto p-8">
+                {isScanning ? (
+                  <div className="flex flex-col items-center justify-center py-12 space-y-6">
+                    <div className="relative">
+                      <div className="w-16 h-16 border-4 border-emerald-100 rounded-full" />
+                      <div className="absolute inset-0 w-16 h-16 border-4 border-emerald-600 border-t-transparent rounded-full animate-spin" />
+                    </div>
+                    <div className="text-center space-y-2">
+                      <p className="text-sm font-bold text-slate-800 uppercase tracking-wider">Gemini is reading your list...</p>
+                      <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Converting image to structured data</p>
+                    </div>
+                  </div>
+                ) : scanError ? (
+                  <div className="flex flex-col items-center justify-center py-12 space-y-4">
+                    <div className="w-16 h-16 bg-rose-50 rounded-full flex items-center justify-center text-rose-500">
+                      <AlertCircle className="w-8 h-8" />
+                    </div>
+                    <div className="text-center space-y-2">
+                      <p className="text-sm font-bold text-slate-800 uppercase tracking-wider">Extraction Failed</p>
+                      <p className="text-xs text-slate-500 max-w-[280px] mx-auto leading-relaxed">{scanError}</p>
+                    </div>
+                    <button 
+                      onClick={() => handleScanAndSave(scanningTask!)}
+                      className="mt-4 px-6 py-2 bg-slate-100 hover:bg-slate-200 text-slate-600 rounded-xl text-xs font-bold uppercase tracking-widest transition-colors"
+                    >
+                      Try Again
+                    </button>
+                  </div>
+                ) : scanResults ? (
+                  <div className="space-y-6">
+                    <div className="bg-emerald-50/50 border border-emerald-100 rounded-2xl p-4 flex items-start gap-3">
+                      <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
+                      <p className="text-xs text-emerald-800 leading-relaxed">
+                        <b>Scan Complete!</b> Gemini has extracted the following items. Please verify the details before saving to the database.
+                      </p>
+                    </div>
+
+                    <div className="overflow-hidden border border-slate-100 rounded-2xl">
+                      <table className="w-full text-left border-collapse">
+                        <thead>
+                          <tr className="bg-slate-50 border-b border-slate-100">
+                            <th className="px-4 py-3 text-[10px] font-black text-slate-400 uppercase tracking-widest">Item</th>
+                            <th className="px-4 py-3 text-[10px] font-black text-slate-400 uppercase tracking-widest text-center">Qty</th>
+                            <th className="px-4 py-3 text-[10px] font-black text-slate-400 uppercase tracking-widest text-right">Price</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-50">
+                          {scanResults.map((row, idx) => (
+                            <tr key={idx} className="hover:bg-slate-50/50 transition-colors">
+                              <td className="px-4 py-3 text-sm font-medium text-slate-700">{row.item}</td>
+                              <td className="px-4 py-3 text-sm font-bold text-slate-600 text-center">{row.quantity}</td>
+                              <td className="px-4 py-3 text-sm font-mono text-slate-500 text-right">
+                                {row.unit_price ? `₹${row.unit_price}` : '-'}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="text-center py-12">
+                    <p className="text-sm font-bold text-slate-400 uppercase tracking-widest">No data extracted</p>
+                  </div>
+                )}
+              </div>
+
+              <div className="p-8 border-t border-slate-100 bg-slate-50/50 shrink-0 flex gap-4">
+                <button 
+                  disabled={isScanning}
+                  onClick={() => setIsScanModalOpen(false)}
+                  className="flex-1 py-4 text-sm font-bold text-slate-400 hover:bg-slate-100 rounded-2xl transition-colors disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+                <button 
+                  disabled={isScanning || !scanResults}
+                  onClick={handleConfirmScan}
+                  className="flex-[2] bg-emerald-600 text-white font-bold py-4 rounded-2xl shadow-lg shadow-emerald-100 active:scale-[0.98] transition-all disabled:opacity-50 disabled:shadow-none flex flex-col items-center justify-center gap-0.5"
+                >
+                  <div className="flex items-center gap-2">
+                    <Database className="w-4 h-4" />
+                    Save to Database
+                  </div>
+                  {isGoogleConnected && (
+                    <span className="text-[9px] opacity-80 font-medium uppercase tracking-widest">+ Sync to Google Sheets</span>
+                  )}
+                </button>
+              </div>
+              
+              {!isGoogleConnected && (
+                <div className="px-8 pb-8">
+                  <button 
+                    onClick={handleConnectGoogle}
+                    className="w-full py-3 bg-white border border-slate-200 text-slate-600 rounded-xl text-xs font-bold flex items-center justify-center gap-2 hover:bg-slate-50 transition-colors"
+                  >
+                    <img src="https://www.gstatic.com/images/branding/product/1x/gdrive_48dp.png" className="w-4 h-4" alt="Drive" />
+                    Connect Google Drive to Sync Sheets
+                  </button>
+                </div>
+              )}
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
 
       {/* Create Trek Modal */}
       <AnimatePresence>
