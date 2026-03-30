@@ -26,6 +26,205 @@ const isProd = process.env.NODE_ENV === 'production';
 app.set('trust proxy', 1);
 
 app.use(express.json());
+// Proxy route to bypass CORS for image scanning
+app.get("/api/proxy-image", async (req, res) => {
+  const imageUrl = req.query.url;
+  if (!imageUrl) return res.status(400).send("URL is required");
+  
+  try {
+    const response = await fetch(imageUrl);
+    if (!response.ok) throw new Error(`Failed to fetch: ${response.statusText}`);
+    
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+    
+    res.set("Content-Type", response.headers.get("Content-Type") || "image/jpeg");
+    res.set("Access-Control-Allow-Origin", "*");
+    res.send(buffer);
+  } catch (error) {
+    console.error("Proxy error:", error);
+    res.status(500).send("Failed to proxy image");
+  }
+});
+
+// Google OAuth Routes
+app.get("/api/auth/google/url", (req, res) => {
+  try {
+    console.log("Request to /api/auth/google/url received");
+    // Force HTTPS in production, otherwise use request headers
+    let appUrl = process.env.APP_URL;
+    if (!appUrl) {
+      const protocol = isProd ? 'https' : req.protocol;
+      appUrl = `${protocol}://${req.get('host')}`;
+    }
+    
+    const redirectUri = `${appUrl.replace(/\/$/, "")}/api/auth/google/callback`;
+    
+    console.log("Generating OAuth URL with redirectUri:", redirectUri);
+    
+    const url = oauth2Client.generateAuthUrl({
+      access_type: 'offline',
+      scope: SCOPES,
+      redirect_uri: redirectUri,
+      prompt: 'select_account consent'
+    });
+    res.json({ url });
+  } catch (error) {
+    console.error("Error generating OAuth URL:", error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/api/auth/google/callback", async (req, res) => {
+  const { code } = req.query;
+  let appUrl = process.env.APP_URL;
+  if (!appUrl) {
+    const protocol = isProd ? 'https' : req.protocol;
+    appUrl = `${protocol}://${req.get('host')}`;
+  }
+  const redirectUri = `${appUrl.replace(/\/$/, "")}/api/auth/google/callback`;
+  console.log("Handling OAuth callback with redirect:", redirectUri);
+
+  try {
+    const { tokens } = await oauth2Client.getToken({
+      code: code,
+      redirect_uri: redirectUri
+    });
+    console.log("Tokens received, setting session...");
+    req.session.tokens = tokens;
+    
+    res.send(`
+      <html>
+        <body>
+          <script>
+            if (window.opener) {
+              window.opener.postMessage({ type: 'OAUTH_AUTH_SUCCESS' }, '*');
+              window.close();
+            } else {
+              window.location.href = '/';
+            }
+          </script>
+          <p>Authentication successful. This window should close automatically.</p>
+        </body>
+      </html>
+    `);
+  } catch (error) {
+    console.error("OAuth error:", error);
+    res.status(500).send("Authentication failed");
+  }
+});
+
+app.get("/api/google/status", (req, res) => {
+  const connected = !!req.session?.tokens;
+  console.log("Checking Google status. Session ID:", req.session?.id, "Connected:", connected);
+  res.json({ connected });
+});
+
+app.post("/api/google/save-list", async (req, res) => {
+  if (!req.session?.tokens) {
+    return res.status(401).json({ error: "Not connected to Google Drive" });
+  }
+
+  const { trekName, taskTitle, data } = req.body;
+  if (!trekName || !data) {
+    return res.status(400).json({ error: "Missing trek name or data" });
+  }
+
+  try {
+    console.log("Starting Google Sheets sync for trek:", trekName, "task:", taskTitle);
+    oauth2Client.setCredentials(req.session.tokens);
+    const drive = google.drive({ version: 'v3', auth: oauth2Client });
+    const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
+
+    // 1. Find or create "Trek Ops App" folder
+    let folderId;
+    console.log("Searching for 'Trek Ops App' folder...");
+    const folderResponse = await drive.files.list({
+      q: "name = 'Trek Ops App' and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
+      fields: 'files(id)',
+      spaces: 'drive'
+    });
+
+    if (folderResponse.data.files && folderResponse.data.files.length > 0) {
+      folderId = folderResponse.data.files[0].id;
+      console.log("Found existing folder:", folderId);
+    } else {
+      console.log("Creating new 'Trek Ops App' folder...");
+      const folderMetadata = {
+        name: 'Trek Ops App',
+        mimeType: 'application/vnd.google-apps.folder'
+      };
+      const folder = await drive.files.create({
+        requestBody: folderMetadata,
+        fields: 'id'
+      });
+      folderId = folder.data.id;
+      console.log("Created folder:", folderId);
+    }
+
+    // 2. Find or create Sheet for this trek inside the folder
+    let sheetId;
+    console.log(`Searching for spreadsheet '${trekName}' in folder ${folderId}...`);
+    const sheetResponse = await drive.files.list({
+      q: `name = '${trekName}' and '${folderId}' in parents and mimeType = 'application/vnd.google-apps.spreadsheet' and trashed = false`,
+      fields: 'files(id)',
+      spaces: 'drive'
+    });
+
+    if (sheetResponse.data.files && sheetResponse.data.files.length > 0) {
+      sheetId = sheetResponse.data.files[0].id;
+      console.log("Found existing spreadsheet:", sheetId);
+    } else {
+      console.log("Creating new spreadsheet:", trekName);
+      const sheetMetadata = {
+        name: trekName,
+        mimeType: 'application/vnd.google-apps.spreadsheet',
+        parents: [folderId]
+      };
+      const sheet = await drive.files.create({
+        requestBody: sheetMetadata,
+        fields: 'id'
+      });
+      sheetId = sheet.data.id;
+      console.log("Created spreadsheet:", sheetId);
+
+      // Add headers to the new sheet
+      console.log("Adding headers to new sheet...");
+      await sheets.spreadsheets.values.append({
+        spreadsheetId: sheetId,
+        range: 'Sheet1!A1',
+        valueInputOption: 'RAW',
+        requestBody: {
+          values: [['Task', 'Item', 'Quantity', 'Price', 'Scanned At']]
+        }
+      });
+    }
+
+    // 3. Append data to the sheet
+    console.log("Appending data rows...");
+    const values = data.map((row) => [
+      taskTitle,
+      row.item || '-',
+      row.quantity || '-',
+      row.unit_price || '-',
+      new Date().toLocaleString()
+    ]);
+
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: sheetId,
+      range: 'Sheet1!A1',
+      valueInputOption: 'RAW',
+      requestBody: { values }
+    });
+
+    console.log("Sync completed successfully!");
+    res.json({ success: true, sheetId });
+  } catch (error) {
+    console.error("Google Sheets error detail:", error);
+    res.status(500).json({ error: `Failed to save to Google Sheets: ${error.message}` });
+  }
+});
+
 app.use(cookieSession({
   name: 'trekops_session',
   // Ensure we always have a key, even if env var is missing
@@ -37,210 +236,6 @@ app.use(cookieSession({
 }));
 
 async function startServer() {
-
-  // Proxy route to bypass CORS for image scanning
-  app.get("/api/proxy-image", async (req, res) => {
-    const imageUrl = req.query.url;
-    if (!imageUrl) return res.status(400).send("URL is required");
-    
-    try {
-      const response = await fetch(imageUrl);
-      if (!response.ok) throw new Error(`Failed to fetch: ${response.statusText}`);
-      
-      const arrayBuffer = await response.arrayBuffer();
-      const buffer = Buffer.from(arrayBuffer);
-      
-      res.set("Content-Type", response.headers.get("Content-Type") || "image/jpeg");
-      res.set("Access-Control-Allow-Origin", "*");
-      res.send(buffer);
-    } catch (error) {
-      console.error("Proxy error:", error);
-      res.status(500).send("Failed to proxy image");
-    }
-  });
-
-  // Google OAuth Routes
-  app.get("/api/auth/google/url", (req, res) => {
-    try {
-      console.log("Request to /api/auth/google/url received");
-      // Force HTTPS in production, otherwise use request headers
-      let appUrl = process.env.APP_URL;
-      if (!appUrl) {
-        const protocol = isProd ? 'https' : req.protocol;
-        appUrl = `${protocol}://${req.get('host')}`;
-      }
-      
-      const redirectUri = `${appUrl.replace(/\/$/, "")}/api/auth/google/callback`;
-      
-      console.log("Generating OAuth URL with redirectUri:", redirectUri);
-      console.log("APP_URL env:", process.env.APP_URL);
-      console.log("Protocol:", req.protocol);
-      console.log("Host:", req.get('host'));
-      
-      const url = oauth2Client.generateAuthUrl({
-        access_type: 'offline',
-        scope: SCOPES,
-        redirect_uri: redirectUri,
-        prompt: 'select_account consent'
-      });
-      res.json({ url });
-    } catch (error) {
-      console.error("Error generating OAuth URL:", error);
-      res.status(500).json({ error: error.message });
-    }
-  });
-
-  app.get("/api/auth/google/callback", async (req, res) => {
-    const { code } = req.query;
-    let appUrl = process.env.APP_URL;
-    if (!appUrl) {
-      const protocol = isProd ? 'https' : req.protocol;
-      appUrl = `${protocol}://${req.get('host')}`;
-    }
-    const redirectUri = `${appUrl.replace(/\/$/, "")}/api/auth/google/callback`;
-    console.log("Handling OAuth callback with redirect:", redirectUri);
-
-    try {
-      const { tokens } = await oauth2Client.getToken({
-        code: code,
-        redirect_uri: redirectUri
-      });
-      console.log("Tokens received, setting session...");
-      req.session.tokens = tokens;
-      console.log("Session tokens set. Session ID:", req.session?.id);
-      
-      res.send(`
-        <html>
-          <body>
-            <script>
-              if (window.opener) {
-                window.opener.postMessage({ type: 'OAUTH_AUTH_SUCCESS' }, '*');
-                window.close();
-              } else {
-                window.location.href = '/';
-              }
-            </script>
-            <p>Authentication successful. This window should close automatically.</p>
-          </body>
-        </html>
-      `);
-    } catch (error) {
-      console.error("OAuth error:", error);
-      res.status(500).send("Authentication failed");
-    }
-  });
-
-  app.get("/api/google/status", (req, res) => {
-    const connected = !!req.session?.tokens;
-    console.log("Checking Google status. Session ID:", req.session?.id, "Connected:", connected);
-    res.json({ connected });
-  });
-
-  app.post("/api/google/save-list", async (req, res) => {
-    if (!req.session?.tokens) {
-      return res.status(401).json({ error: "Not connected to Google Drive" });
-    }
-
-    const { trekName, taskTitle, data } = req.body;
-    if (!trekName || !data) {
-      return res.status(400).json({ error: "Missing trek name or data" });
-    }
-
-    try {
-      console.log("Starting Google Sheets sync for trek:", trekName, "task:", taskTitle);
-      oauth2Client.setCredentials(req.session.tokens);
-      const drive = google.drive({ version: 'v3', auth: oauth2Client });
-      const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
-
-      // 1. Find or create "Trek Ops App" folder
-      let folderId;
-      console.log("Searching for 'Trek Ops App' folder...");
-      const folderResponse = await drive.files.list({
-        q: "name = 'Trek Ops App' and mimeType = 'application/vnd.google-apps.folder' and trashed = false",
-        fields: 'files(id)',
-        spaces: 'drive'
-      });
-
-      if (folderResponse.data.files && folderResponse.data.files.length > 0) {
-        folderId = folderResponse.data.files[0].id;
-        console.log("Found existing folder:", folderId);
-      } else {
-        console.log("Creating new 'Trek Ops App' folder...");
-        const folderMetadata = {
-          name: 'Trek Ops App',
-          mimeType: 'application/vnd.google-apps.folder'
-        };
-        const folder = await drive.files.create({
-          requestBody: folderMetadata,
-          fields: 'id'
-        });
-        folderId = folder.data.id;
-        console.log("Created folder:", folderId);
-      }
-
-      // 2. Find or create Sheet for this trek inside the folder
-      let sheetId;
-      console.log(`Searching for spreadsheet '${trekName}' in folder ${folderId}...`);
-      const sheetResponse = await drive.files.list({
-        q: `name = '${trekName}' and '${folderId}' in parents and mimeType = 'application/vnd.google-apps.spreadsheet' and trashed = false`,
-        fields: 'files(id)',
-        spaces: 'drive'
-      });
-
-      if (sheetResponse.data.files && sheetResponse.data.files.length > 0) {
-        sheetId = sheetResponse.data.files[0].id;
-        console.log("Found existing spreadsheet:", sheetId);
-      } else {
-        console.log("Creating new spreadsheet:", trekName);
-        const sheetMetadata = {
-          name: trekName,
-          mimeType: 'application/vnd.google-apps.spreadsheet',
-          parents: [folderId]
-        };
-        const sheet = await drive.files.create({
-          requestBody: sheetMetadata,
-          fields: 'id'
-        });
-        sheetId = sheet.data.id;
-        console.log("Created spreadsheet:", sheetId);
-
-        // Add headers to the new sheet
-        console.log("Adding headers to new sheet...");
-        await sheets.spreadsheets.values.append({
-          spreadsheetId: sheetId,
-          range: 'Sheet1!A1',
-          valueInputOption: 'RAW',
-          requestBody: {
-            values: [['Task', 'Item', 'Quantity', 'Price', 'Scanned At']]
-          }
-        });
-      }
-
-      // 3. Append data to the sheet
-      console.log("Appending data rows...");
-      const values = data.map((row) => [
-        taskTitle,
-        row.item || '-',
-        row.quantity || '-',
-        row.unit_price || '-',
-        new Date().toLocaleString()
-      ]);
-
-      await sheets.spreadsheets.values.append({
-        spreadsheetId: sheetId,
-        range: 'Sheet1!A1',
-        valueInputOption: 'RAW',
-        requestBody: { values }
-      });
-
-      console.log("Sync completed successfully!");
-      res.json({ success: true, sheetId });
-    } catch (error) {
-      console.error("Google Sheets error detail:", error);
-      res.status(500).json({ error: `Failed to save to Google Sheets: ${error.message}` });
-    }
-  });
-
   // Vite middleware for development
   if (!isProd) {
     const vite = await createViteServer({
