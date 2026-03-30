@@ -749,64 +749,28 @@ function TrekOpsApp() {
     setIsScanModalOpen(true);
 
     try {
-      // 1. Fetch the image via proxy to bypass CORS
-      const proxyUrl = `/api/proxy-image?url=${encodeURIComponent(task.fileUrl)}`;
-      const response = await fetch(proxyUrl);
-      if (!response.ok) throw new Error('Failed to fetch image via proxy. This might be a connection issue.');
-      
-      const blob = await response.blob();
-      const base64Data = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onloadend = () => resolve((reader.result as string).split(',')[1]);
-        reader.onerror = () => reject(new Error('Failed to read image file.'));
-        reader.readAsDataURL(blob);
+      setIsScanning(true);
+      setScanError(null);
+      setScanResults(null);
+
+      // 1. Send the file URL to our backend for extraction
+      const response = await fetch('/api/extract-data', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fileUrl: task.fileUrl })
       });
 
-      // 2. Initialize Gemini
-      if (!process.env.GEMINI_API_KEY) {
-        throw new Error('Gemini API Key is missing. Please check your environment variables.');
-      }
-      
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-      
-      // 3. Call Gemini to extract data
-      const result = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
-        contents: [
-          {
-            parts: [
-              { text: "Extract the items, quantities, and any prices from this list. Return the data as a JSON array of objects with keys: 'item' (string), 'quantity' (string), and 'unit_price' (number, optional). If a price is not found, omit the key. Focus on making the list clean and readable." },
-              { inlineData: { data: base64Data, mimeType: blob.type } }
-            ]
-          }
-        ],
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                item: { type: Type.STRING },
-                quantity: { type: Type.STRING },
-                unit_price: { type: Type.NUMBER }
-              },
-              required: ["item", "quantity"]
-            }
-          }
-        }
-      });
-
-      if (!result.text) {
-        throw new Error('Gemini returned an empty response. The image might be too blurry or contain no readable text.');
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || 'Failed to extract data from image.');
       }
 
-      const extracted = JSON.parse(result.text);
-      if (!Array.isArray(extracted) || extracted.length === 0) {
+      const { data } = await response.json();
+      if (!Array.isArray(data) || data.length === 0) {
         throw new Error('No items were found in the image.');
       }
       
-      setScanResults(extracted);
+      setScanResults(data);
     } catch (error: any) {
       console.error('Scanning error:', error);
       setScanError(error.message || 'An unexpected error occurred during scanning.');

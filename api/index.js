@@ -3,6 +3,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { google } from "googleapis";
 import cookieSession from "cookie-session";
+import { GoogleGenAI, Type } from "@google/genai";
 
 console.log("API Index loading... ENV:", process.env.NODE_ENV);
 
@@ -17,15 +18,20 @@ process.on('uncaughtException', (err) => {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const oauth2Client = new google.auth.OAuth2(
-  process.env.GOOGLE_CLIENT_ID,
-  process.env.GOOGLE_CLIENT_SECRET,
-);
-
 const SCOPES = [
   'https://www.googleapis.com/auth/drive.file',
   'https://www.googleapis.com/auth/spreadsheets'
 ];
+
+function getOAuth2Client() {
+  if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) {
+    throw new Error("Missing GOOGLE_CLIENT_ID or GOOGLE_CLIENT_SECRET in environment variables.");
+  }
+  return new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET
+  );
+}
 
 const app = express();
 const isProd = process.env.NODE_ENV === 'production';
@@ -71,10 +77,83 @@ app.get("/api/proxy-image", async (req, res) => {
   }
 });
 
+// Gemini Data Extraction Route
+app.post("/api/extract-data", async (req, res) => {
+  const { fileUrl } = req.body;
+  if (!fileUrl) return res.status(400).json({ error: "File URL is required" });
+
+  if (!process.env.GEMINI_API_KEY) {
+    console.error("GEMINI_API_KEY is missing in environment variables");
+    return res.status(500).json({ error: "Gemini API Key is missing on the server. Please check Vercel environment variables." });
+  }
+
+  try {
+    console.log("Starting Gemini extraction for:", fileUrl);
+    
+    // 1. Fetch the image
+    const imageResponse = await fetch(fileUrl);
+    if (!imageResponse.ok) throw new Error(`Failed to fetch image: ${imageResponse.statusText}`);
+    
+    const arrayBuffer = await imageResponse.arrayBuffer();
+    const base64Data = Buffer.from(arrayBuffer).toString('base64');
+    const mimeType = imageResponse.headers.get("Content-Type") || "image/jpeg";
+
+    // 2. Initialize Gemini
+    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+    
+    // 3. Call Gemini
+    const result = await ai.models.generateContent({
+      model: "gemini-3-flash-preview",
+      contents: [
+        {
+          parts: [
+            { text: "Extract the items, quantities, and any prices from this list. Return the data as a JSON array of objects with keys: 'item' (string), 'quantity' (string), and 'unit_price' (number, optional). If a price is not found, omit the key. Focus on making the list clean and readable." },
+            { inlineData: { data: base64Data, mimeType } }
+          ]
+        }
+      ],
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              item: { type: Type.STRING },
+              quantity: { type: Type.STRING },
+              unit_price: { type: Type.NUMBER }
+            },
+            required: ["item", "quantity"]
+          }
+        }
+      }
+    });
+
+    if (!result.text) {
+      throw new Error("Gemini returned an empty response.");
+    }
+
+    const data = JSON.parse(result.text);
+    console.log("Extraction successful, found items:", data.length);
+    res.json({ data });
+  } catch (error) {
+    console.error("Extraction error:", error);
+    res.status(500).json({ error: `AI Extraction failed: ${error.message}` });
+  }
+});
+
 // Google OAuth Routes
 app.get("/api/auth/google/url", (req, res) => {
   try {
     console.log("Request to /api/auth/google/url received");
+    
+    if (!process.env.GOOGLE_CLIENT_ID || !process.env.GOOGLE_CLIENT_SECRET) {
+      console.error("MISSING GOOGLE CREDENTIALS in ENV");
+      return res.status(500).json({ 
+        error: "Server configuration error: Google Client ID or Secret is missing in environment variables." 
+      });
+    }
+
     // Force HTTPS in production, otherwise use request headers
     let appUrl = process.env.APP_URL;
     if (!appUrl) {
@@ -86,12 +165,14 @@ app.get("/api/auth/google/url", (req, res) => {
     
     console.log("Generating OAuth URL with redirectUri:", redirectUri);
     
-    const url = oauth2Client.generateAuthUrl({
+    const client = getOAuth2Client();
+    const url = client.generateAuthUrl({
       access_type: 'offline',
       scope: SCOPES,
       redirect_uri: redirectUri,
       prompt: 'select_account consent'
     });
+    console.log("Generated URL starts with:", url.substring(0, 100));
     res.json({ url });
   } catch (error) {
     console.error("Error generating OAuth URL:", error);
@@ -110,7 +191,8 @@ app.get("/api/auth/google/callback", async (req, res) => {
   console.log("Handling OAuth callback with redirect:", redirectUri);
 
   try {
-    const { tokens } = await oauth2Client.getToken({
+    const client = getOAuth2Client();
+    const { tokens } = await client.getToken({
       code: code,
       redirect_uri: redirectUri
     });
@@ -156,9 +238,10 @@ app.post("/api/google/save-list", async (req, res) => {
 
   try {
     console.log("Starting Google Sheets sync for trek:", trekName, "task:", taskTitle);
-    oauth2Client.setCredentials(req.session.tokens);
-    const drive = google.drive({ version: 'v3', auth: oauth2Client });
-    const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
+    const client = getOAuth2Client();
+    client.setCredentials(req.session.tokens);
+    const drive = google.drive({ version: 'v3', auth: client });
+    const sheets = google.sheets({ version: 'v4', auth: client });
 
     // 1. Find or create "Trek Ops App" folder
     let folderId;
@@ -186,11 +269,12 @@ app.post("/api/google/save-list", async (req, res) => {
       console.log("Created folder:", folderId);
     }
 
-    // 2. Find or create Sheet for this trek inside the folder
+    // 2. Find or create Sheet for this specific task inside the folder
     let sheetId;
-    console.log(`Searching for spreadsheet '${trekName}' in folder ${folderId}...`);
+    const sheetName = `${trekName} - ${taskTitle}`;
+    console.log(`Searching for spreadsheet '${sheetName}' in folder ${folderId}...`);
     const sheetResponse = await drive.files.list({
-      q: `name = '${trekName}' and '${folderId}' in parents and mimeType = 'application/vnd.google-apps.spreadsheet' and trashed = false`,
+      q: `name = '${sheetName}' and '${folderId}' in parents and mimeType = 'application/vnd.google-apps.spreadsheet' and trashed = false`,
       fields: 'files(id)',
       spaces: 'drive'
     });
@@ -199,9 +283,9 @@ app.post("/api/google/save-list", async (req, res) => {
       sheetId = sheetResponse.data.files[0].id;
       console.log("Found existing spreadsheet:", sheetId);
     } else {
-      console.log("Creating new spreadsheet:", trekName);
+      console.log("Creating new spreadsheet:", sheetName);
       const sheetMetadata = {
-        name: trekName,
+        name: sheetName,
         mimeType: 'application/vnd.google-apps.spreadsheet',
         parents: [folderId]
       };
