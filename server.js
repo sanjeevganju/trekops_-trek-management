@@ -61,8 +61,13 @@ async function startServer() {
 
   // Google OAuth Routes
   app.get("/api/auth/google/url", (req, res) => {
-    // Use the APP_URL provided by the environment, fallback to request headers
-    const appUrl = process.env.APP_URL || `${req.protocol}://${req.get('host')}`;
+    // Force HTTPS in production, otherwise use request headers
+    let appUrl = process.env.APP_URL;
+    if (!appUrl) {
+      const protocol = isProd ? 'https' : req.protocol;
+      appUrl = `${protocol}://${req.get('host')}`;
+    }
+    
     const redirectUri = `${appUrl.replace(/\/$/, "")}/api/auth/google/callback`;
     
     console.log("Generating OAuth URL with redirectUri:", redirectUri);
@@ -81,7 +86,11 @@ async function startServer() {
 
   app.get("/api/auth/google/callback", async (req, res) => {
     const { code } = req.query;
-    const appUrl = process.env.APP_URL || `${req.protocol}://${req.get('host')}`;
+    let appUrl = process.env.APP_URL;
+    if (!appUrl) {
+      const protocol = isProd ? 'https' : req.protocol;
+      appUrl = `${protocol}://${req.get('host')}`;
+    }
     const redirectUri = `${appUrl.replace(/\/$/, "")}/api/auth/google/callback`;
     console.log("Handling OAuth callback with redirect:", redirectUri);
 
