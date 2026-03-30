@@ -320,8 +320,17 @@ function TrekOpsApp() {
   const handleConnectGoogle = async () => {
     try {
       const res = await fetch('/api/auth/google/url', { credentials: 'include' });
+      if (!res.ok) {
+        const errorData = await res.json();
+        throw new Error(errorData.error || 'Failed to get auth URL');
+      }
       const { url } = await res.json();
-      window.open(url, 'google_oauth', 'width=600,height=700');
+      const authWindow = window.open(url, 'google_oauth', 'width=600,height=700');
+      
+      if (!authWindow) {
+        alert('Popup blocked! Please allow popups for this site to connect Google Drive.');
+        return;
+      }
       
       // Start polling for status since postMessage can be unreliable in some browsers
       let attempts = 0;
@@ -334,6 +343,7 @@ function TrekOpsApp() {
       }, 2000);
     } catch (error) {
       console.error("Failed to get Google auth URL:", error);
+      alert(`Connection Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   };
 

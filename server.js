@@ -31,10 +31,11 @@ async function startServer() {
   app.use(express.json());
   app.use(cookieSession({
     name: 'trekops_session',
-    keys: [process.env.SESSION_SECRET || 'trek-ops-secret-key-2026'],
+    // Ensure we always have a key, even if env var is missing
+    keys: [process.env.SESSION_SECRET || 'trek-ops-permanent-secret-2026-xyz-987'],
     maxAge: 24 * 60 * 60 * 1000, // 24 hours
     secure: isProd, 
-    sameSite: 'lax', // Changed from 'none' to 'lax' for better Vercel compatibility
+    sameSite: 'lax', 
     httpOnly: true,
   }));
 
@@ -61,27 +62,33 @@ async function startServer() {
 
   // Google OAuth Routes
   app.get("/api/auth/google/url", (req, res) => {
-    // Force HTTPS in production, otherwise use request headers
-    let appUrl = process.env.APP_URL;
-    if (!appUrl) {
-      const protocol = isProd ? 'https' : req.protocol;
-      appUrl = `${protocol}://${req.get('host')}`;
+    try {
+      console.log("Request to /api/auth/google/url received");
+      // Force HTTPS in production, otherwise use request headers
+      let appUrl = process.env.APP_URL;
+      if (!appUrl) {
+        const protocol = isProd ? 'https' : req.protocol;
+        appUrl = `${protocol}://${req.get('host')}`;
+      }
+      
+      const redirectUri = `${appUrl.replace(/\/$/, "")}/api/auth/google/callback`;
+      
+      console.log("Generating OAuth URL with redirectUri:", redirectUri);
+      console.log("APP_URL env:", process.env.APP_URL);
+      console.log("Protocol:", req.protocol);
+      console.log("Host:", req.get('host'));
+      
+      const url = oauth2Client.generateAuthUrl({
+        access_type: 'offline',
+        scope: SCOPES,
+        redirect_uri: redirectUri,
+        prompt: 'select_account consent'
+      });
+      res.json({ url });
+    } catch (error) {
+      console.error("Error generating OAuth URL:", error);
+      res.status(500).json({ error: error.message });
     }
-    
-    const redirectUri = `${appUrl.replace(/\/$/, "")}/api/auth/google/callback`;
-    
-    console.log("Generating OAuth URL with redirectUri:", redirectUri);
-    console.log("APP_URL env:", process.env.APP_URL);
-    console.log("Protocol:", req.protocol);
-    console.log("Host:", req.get('host'));
-    
-    const url = oauth2Client.generateAuthUrl({
-      access_type: 'offline',
-      scope: SCOPES,
-      redirect_uri: redirectUri,
-      prompt: 'select_account consent'
-    });
-    res.json({ url });
   });
 
   app.get("/api/auth/google/callback", async (req, res) => {
