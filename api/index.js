@@ -1,9 +1,18 @@
 import express from "express";
 import path from "path";
 import { fileURLToPath } from "url";
-import { createServer as createViteServer } from "vite";
 import { google } from "googleapis";
 import cookieSession from "cookie-session";
+
+console.log("API Index loading... ENV:", process.env.NODE_ENV);
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+});
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -11,7 +20,6 @@ const __dirname = path.dirname(__filename);
 const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
   process.env.GOOGLE_CLIENT_SECRET,
-  // The redirect URI will be constructed dynamically in the routes
 );
 
 const SCOPES = [
@@ -26,6 +34,22 @@ const isProd = process.env.NODE_ENV === 'production';
 app.set('trust proxy', 1);
 
 app.use(express.json());
+
+// Session middleware MUST be before routes
+app.use(cookieSession({
+  name: 'trekops_session',
+  keys: [process.env.SESSION_SECRET || 'trek-ops-permanent-secret-2026-xyz-987'],
+  maxAge: 24 * 60 * 60 * 1000, // 24 hours
+  secure: isProd, 
+  sameSite: 'lax', 
+  httpOnly: true,
+}));
+
+// Health check
+app.get("/api/health", (req, res) => {
+  res.json({ status: "ok", env: process.env.NODE_ENV });
+});
+
 // Proxy route to bypass CORS for image scanning
 app.get("/api/proxy-image", async (req, res) => {
   const imageUrl = req.query.url;
@@ -225,38 +249,25 @@ app.post("/api/google/save-list", async (req, res) => {
   }
 });
 
-app.use(cookieSession({
-  name: 'trekops_session',
-  // Ensure we always have a key, even if env var is missing
-  keys: [process.env.SESSION_SECRET || 'trek-ops-permanent-secret-2026-xyz-987'],
-  maxAge: 24 * 60 * 60 * 1000, // 24 hours
-  secure: isProd, 
-  sameSite: 'lax', 
-  httpOnly: true,
-}));
-
-async function startServer() {
-  // Vite middleware for development
-  if (!isProd) {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
-    app.use(vite.middlewares);
-    const PORT = 3000;
-    app.listen(PORT, "0.0.0.0", () => {
-      console.log(`Server running on http://0.0.0.0:${PORT}`);
-    });
-  } else {
-    // Serve static files from the 'dist' directory
-    const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
-    });
-  }
+// Vite middleware for development
+if (!isProd) {
+  const startDevServer = async () => {
+    try {
+      const { createServer: createViteServer } = await import("vite");
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: "spa",
+      });
+      app.use(vite.middlewares);
+      const PORT = 3000;
+      app.listen(PORT, "0.0.0.0", () => {
+        console.log(`Server running on http://0.0.0.0:${PORT}`);
+      });
+    } catch (e) {
+      console.error("Failed to start Vite server:", e);
+    }
+  };
+  startDevServer();
 }
-
-startServer();
 
 export default app;
