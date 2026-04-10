@@ -1,5 +1,8 @@
 export const formatDate = (dateString: string) => {
-  return new Date(dateString).toLocaleDateString('en-GB', {
+  if (!dateString) return 'No Date';
+  const date = new Date(dateString);
+  if (isNaN(date.getTime())) return 'Invalid Date';
+  return date.toLocaleDateString('en-GB', {
     day: 'numeric',
     month: 'short',
     year: 'numeric',

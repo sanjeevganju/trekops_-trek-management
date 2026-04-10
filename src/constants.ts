@@ -37,6 +37,7 @@ export const TASK_TEMPLATES: Record<Category, TaskTemplate[]> = {
   'Team Assigned': [
     { title: 'Trip Leader', description: 'Select trip leader and enter contact number', deadlineOffset: 10, type: 'select', options: ['John Doe', 'Jane Smith', 'Tenzing Norgay'] },
     { title: 'Cook', description: 'Select cook and enter contact number', deadlineOffset: 10, type: 'select', options: ['Chef Ram', 'Chef Hari'] },
+    { title: 'Horseman', description: 'Select horseman and enter contact number', deadlineOffset: 10, type: 'select', options: [] },
     { title: 'Assistant Guides', description: 'Enter number of assistant guides and select from staff list', deadlineOffset: 8, type: 'number' },
     { title: 'Support Staff', description: 'Enter number of support staff and select from staff list', deadlineOffset: 8, type: 'number' },
     { title: 'Personal Porter', description: 'Enter number of personal porters and select from staff list', deadlineOffset: 5, type: 'number' },

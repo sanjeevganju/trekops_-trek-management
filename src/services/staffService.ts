@@ -3,6 +3,7 @@ export interface StaffMember {
   name: string;
   contact: string;
   role?: string;
+  region?: string;
 }
 
 export async function fetchStaffList(): Promise<StaffMember[]> {
@@ -24,6 +25,7 @@ export async function fetchStaffList(): Promise<StaffMember[]> {
     const staff: StaffMember[] = rows.slice(1) // Skip header
       .filter(row => row[1] && row[1].trim() !== '') // Filter empty rows (checking first_name)
       .map(row => {
+        const region = (row[0] || '').trim();
         const firstName = (row[1] || '').trim();
         const secondName = (row[2] || '').trim();
         const skill = (row[3] || '').trim();
@@ -32,7 +34,8 @@ export async function fetchStaffList(): Promise<StaffMember[]> {
         return {
           name: `${firstName} ${secondName}`.trim(),
           contact: contact,
-          role: skill
+          role: skill,
+          region: region
         };
       });
       

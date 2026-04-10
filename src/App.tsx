@@ -41,7 +41,9 @@ import {
   ChevronDown,
   Shield,
   Lock,
-  Cloud
+  Cloud,
+  ExternalLink,
+  WifiOff
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
@@ -51,6 +53,7 @@ import {
   addDoc, 
   updateDoc, 
   doc, 
+  getDoc,
   getDocFromServer,
   where,
   orderBy,
@@ -73,7 +76,8 @@ import {
   ref, 
   uploadBytesResumable, 
   getDownloadURL,
-  deleteObject
+  deleteObject,
+  listAll
 } from 'firebase/storage';
 import { GoogleGenAI, Type } from "@google/genai";
 import { db, auth, storage } from './firebase';
@@ -84,6 +88,106 @@ import { fetchSalesTrips, SalesTrip } from './services/salesService';
 import { fetchDrivers, fetchVehicles, Driver, Vehicle } from './services/transportService';
 
 // --- Error Handling ---
+// --- Utilities ---
+const parseTrekDate = (date: any): Date => {
+  try {
+    if (!date) return new Date(0);
+    
+    // Handle Firestore Timestamp
+    if (typeof date === 'object' && date !== null && 'seconds' in date) {
+      return new Date(date.seconds * 1000);
+    }
+    if (date && typeof date.toDate === 'function') {
+      return date.toDate();
+    }
+    
+    // Handle string or number
+    let d = new Date(date);
+    if (!isNaN(d.getTime())) return d;
+    
+    // Handle DD-MMM-YYYY manually (e.g., 13-Mar-2026)
+    if (typeof date === 'string') {
+      const clean = date.trim();
+      const parts = clean.split(/[-/.]/);
+      if (parts.length === 3) {
+        let [day, month, year] = parts;
+        // If year is first (YYYY-MM-DD), parts[0] is year
+        if (day.length === 4) {
+          [year, month, day] = [parts[0], parts[1], parts[2]];
+        }
+        
+        const monthMap: Record<string, string> = {
+          jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06',
+          jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12'
+        };
+        
+        if (isNaN(Number(month))) {
+          month = monthMap[month.toLowerCase().substring(0, 3)] || '01';
+        }
+        
+        const fullYear = year.length === 2 ? `20${year}` : year;
+        const isoStr = `${fullYear}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+        d = new Date(isoStr);
+        if (!isNaN(d.getTime())) return d;
+      }
+    }
+    return new Date(0);
+  } catch (e) {
+    console.error("Error parsing date:", date, e);
+    return new Date(0);
+  }
+};
+
+const normalizeRegion = (region: any): string => {
+  try {
+    if (!region || typeof region !== 'string') return 'Nepal';
+    const r = region.toUpperCase().trim();
+    
+    if (r.includes('HIMACHAL')) return 'Himachal';
+    if (r.includes('UTTARAKHAND')) return 'Uttarakhand';
+    if (r.includes('LADAKH')) return 'Ladakh';
+    if (r.includes('J&K') || r.includes('KASHMIR')) return 'Kashmir';
+    if (r.includes('SIKKIM')) return 'Sikkim';
+    if (r.includes('BHUTAN')) return 'Bhutan';
+    if (r.includes('NEPAL')) return 'Nepal';
+    
+    return region.charAt(0).toUpperCase() + region.slice(1).toLowerCase();
+  } catch (e) {
+    return 'Nepal';
+  }
+};
+
+const getTrekDateString = (date: any): string => {
+  const d = parseTrekDate(date);
+  if (isNaN(d.getTime()) || d.getTime() === 0) return 'no-date';
+  // Use local date parts to avoid timezone shifts in toISOString
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
+
+const getStableTrekId = (trek: { name: string; startDate: any }): string => {
+  const trekNameSlug = trek.name.toLowerCase().trim().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+  const trekDateStr = getTrekDateString(trek.startDate);
+  return `trek-${trekNameSlug}-${trekDateStr}`;
+};
+
+const getTaskStableId = (trekStableId: string, taskTitle: string): string => {
+  const taskNameSlug = taskTitle.toLowerCase().trim().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+  return `task-${trekStableId}-${taskNameSlug}`;
+};
+
+const isTaskRelatedToTrek = (task: any, trekId: string, stableTrekId: string): boolean => {
+  if (!task) return false;
+  const tid = task.trekId;
+  const id = task.id;
+  return tid === trekId || 
+         tid === stableTrekId || 
+         (id && id.startsWith(`task-${stableTrekId}-`)) ||
+         (id && id.startsWith(`task-${trekId}-`));
+};
+
 enum OperationType {
   CREATE = 'create',
   UPDATE = 'update',
@@ -155,6 +259,7 @@ class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoundarySta
   }
 
   static getDerivedStateFromError(error: any) {
+    console.error("ErrorBoundary caught error:", error);
     return { hasError: true, error };
   }
 
@@ -165,10 +270,14 @@ class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoundarySta
         const parsed = JSON.parse(this.state.error.message);
         if (parsed.error.includes('insufficient permissions')) {
           message = "You don't have permission to perform this action.";
+        } else {
+          message = parsed.error;
         }
       } catch (e) {
-        // Not a JSON error
+        message = this.state.error?.message || String(this.state.error);
       }
+      const isAuthError = message.includes('auth/') || message.includes('Pending promise');
+
       return (
         <div className="min-h-screen flex flex-col items-center justify-center p-6 text-center bg-slate-50">
           <div className="bg-rose-50 p-4 rounded-full mb-4">
@@ -176,12 +285,27 @@ class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoundarySta
           </div>
           <h2 className="text-xl font-bold text-slate-800 mb-2">Oops!</h2>
           <p className="text-slate-500 mb-6 max-w-xs">{message}</p>
-          <button 
-            onClick={() => window.location.reload()}
-            className="bg-emerald-600 text-white font-bold px-8 py-3 rounded-2xl shadow-lg shadow-emerald-200"
-          >
-            Reload App
-          </button>
+          
+          {isAuthError && (
+            <p className="text-xs text-amber-600 mb-6 max-w-xs bg-amber-50 p-3 rounded-lg border border-amber-100">
+              This looks like a login issue. Try "Reset App State" below to clear the error.
+            </p>
+          )}
+
+          <div className="flex flex-col sm:flex-row gap-4">
+            <button 
+              onClick={() => window.location.reload()}
+              className="bg-emerald-600 text-white font-bold px-8 py-3 rounded-2xl shadow-lg shadow-emerald-200"
+            >
+              Reload App
+            </button>
+            <button 
+              onClick={() => this.setState({ hasError: false, error: null })}
+              className="bg-white border border-slate-200 text-slate-600 font-bold px-8 py-3 rounded-2xl hover:bg-slate-50 transition-all"
+            >
+              Reset App State
+            </button>
+          </div>
         </div>
       );
     }
@@ -201,6 +325,7 @@ interface Task {
   type: 'number' | 'text' | 'file' | 'select' | 'amount';
   value?: any;
   fileUrl?: string;
+  files?: { url: string, name: string }[];
   isNA?: boolean;
   options?: string[];
   subtasks?: any[];
@@ -232,19 +357,28 @@ function TrekOpsApp() {
   const [selectedCategory, setSelectedCategory] = useState<Category | null>(null);
   const [treks, setTreks] = useState<TrekInstance[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [tasksLoaded, setTasksLoaded] = useState(false);
 
   const getTrekProgress = (trekId: string) => {
-    const trekTasks = tasks.filter(t => t.trekId === trekId);
-    if (trekTasks.length === 0) return { percent: 0, color: 'bg-rose-500' };
-    
-    const completedTasks = trekTasks.filter(t => t.status === 'completed' || t.isNA).length;
-    const percent = Math.round((completedTasks / trekTasks.length) * 100);
-    
-    if (percent === 100) return { percent, color: 'bg-emerald-500' };
-    if (percent >= 75) return { percent, color: 'bg-blue-500' };
-    if (percent >= 50) return { percent, color: 'bg-yellow-400' };
-    if (percent >= 25) return { percent, color: 'bg-orange-500' };
-    return { percent, color: 'bg-rose-500' };
+    try {
+      if (!tasks || !Array.isArray(tasks)) return { percent: 0, color: 'bg-slate-300' };
+      const trek = treks.find(t => t.id === trekId);
+      const stableTrekId = trek ? getStableTrekId(trek) : trekId;
+      const trekTasks = tasks.filter(t => isTaskRelatedToTrek(t, trekId, stableTrekId));
+      if (trekTasks.length === 0) return { percent: 0, color: 'bg-rose-500' };
+      
+      const completedTasks = trekTasks.filter(t => t.status === 'completed' || t.isNA).length;
+      const percent = Math.round((completedTasks / trekTasks.length) * 100);
+      
+      if (percent === 100) return { percent, color: 'bg-emerald-500' };
+      if (percent >= 75) return { percent, color: 'bg-blue-500' };
+      if (percent >= 50) return { percent, color: 'bg-yellow-400' };
+      if (percent >= 25) return { percent, color: 'bg-orange-500' };
+      return { percent, color: 'bg-rose-500' };
+    } catch (e) {
+      console.error("Error calculating trek progress:", e);
+      return { percent: 0, color: 'bg-slate-300' };
+    }
   };
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isSalesModalOpen, setIsSalesModalOpen] = useState(false);
@@ -295,11 +429,15 @@ function TrekOpsApp() {
 
   const [isRefreshingStatus, setIsRefreshingStatus] = useState(false);
 
+  // @ts-ignore - accessing internal property for debugging
+  const dbId = (db as any)._databaseId?.database || '(default)';
+
   const checkGoogleStatus = async () => {
+    if (!user) return false;
     setIsRefreshingStatus(true);
     console.log('Manually checking Google status...');
     try {
-      const res = await fetch('/api/google/status', { credentials: 'include' });
+      const res = await fetch(`/api/google/status?userId=${user.uid}`, { credentials: 'include' });
       const data = await res.json();
       console.log('Google status check result:', data);
       setIsGoogleConnected(data.connected);
@@ -313,42 +451,107 @@ function TrekOpsApp() {
     }
   };
 
+  // Expose to window for the popup to call
+  useEffect(() => {
+    (window as any).checkGoogleStatus = checkGoogleStatus;
+    return () => { delete (window as any).checkGoogleStatus; };
+  }, [user]);
+
   const handleConnectGoogle = async () => {
+    if (!user) return;
     try {
-      const res = await fetch('/api/auth/google/url', { credentials: 'include' });
+      const res = await fetch(`/api/auth/google/url?userId=${user.uid}`, { credentials: 'include' });
       if (!res.ok) {
         const errorData = await res.json();
         throw new Error(errorData.error || 'Failed to get auth URL');
       }
       const { url } = await res.json();
+      
       const authWindow = window.open(url, 'google_oauth', 'width=600,height=700');
       
       if (!authWindow) {
         alert('Popup blocked! Please allow popups for this site to connect Google Drive.');
         return;
       }
-      
-      // Start polling for status since postMessage can be unreliable in some browsers
-      let attempts = 0;
-      const interval = setInterval(async () => {
-        attempts++;
-        const connected = await checkGoogleStatus();
-        if (connected || attempts > 20) {
-          clearInterval(interval);
-        }
-      }, 2000);
     } catch (error) {
       console.error("Failed to get Google auth URL:", error);
       alert(`Connection Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   };
 
+  // Listen to Google connection status in Firestore
+  useEffect(() => {
+    if (!user) {
+      setIsGoogleConnected(false);
+      return;
+    }
+
+    const userDocRef = doc(db, "users", user.uid);
+    // @ts-ignore - accessing internal property for debugging
+    const dbId = db._databaseId?.database || '(default)';
+    console.log("Setting up Firestore listener for user:", user.uid, "on project:", db.app.options.projectId, "database:", dbId);
+    const unsubscribe = onSnapshot(userDocRef, (doc) => {
+      if (doc.exists()) {
+        const data = doc.data();
+        console.log("User doc update received:", data);
+        if (data.google_auth) {
+          console.log("Google connection detected in Firestore");
+          setIsGoogleConnected(true);
+        } else {
+          console.log("Google connection NOT found in doc");
+          setIsGoogleConnected(false);
+        }
+      } else {
+        console.log("User doc does not exist yet");
+        setIsGoogleConnected(false);
+      }
+    }, (err) => {
+      console.error("Firestore listener error:", err);
+    });
+
+    // Also do an initial check via API
+    checkGoogleStatus();
+
+    return () => unsubscribe();
+  }, [user]);
+
+  const [debugLogs, setDebugLogs] = useState<any[]>([]);
+  const [showDebug, setShowDebug] = useState(false);
+
+  // Listen to debug logs
+  useEffect(() => {
+    if (!user || !showDebug) return;
+    const q = query(collection(db, "debug_logs"), orderBy("timestamp", "desc"), limit(10));
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const logs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      setDebugLogs(logs);
+    }, (error) => {
+      console.error("Debug logs listener error:", error);
+    });
+    return () => unsubscribe();
+  }, [user, showDebug]);
+
+  const [backendStatus, setBackendStatus] = useState<any>(null);
+
+  useEffect(() => {
+    if (!user || !showDebug) return;
+    const unsubscribe = onSnapshot(doc(db, "system_status", "backend"), (doc) => {
+      if (doc.exists()) {
+        setBackendStatus(doc.data());
+      }
+    }, (err) => {
+      console.error("Error listening to backend status:", err);
+      setBackendStatus(null);
+    });
+    return () => unsubscribe();
+  }, [user, showDebug]);
+
   const handleSyncToSheets = async (task: Task) => {
-    if (!isGoogleConnected || !selectedTrek) return;
+    if (!isGoogleConnected || !selectedTrek || !user) return;
     
     try {
       setIsScanning(true);
-      // Fetch the extracted data from Firestore for this task
+      console.log("Syncing to sheets for task:", task.title);
       const q = query(
         collection(db, 'extracted_lists'), 
         where('taskId', '==', task.id),
@@ -369,6 +572,7 @@ function TrekOpsApp() {
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
         body: JSON.stringify({
+          userId: user.uid,
           trekName: selectedTrek.name,
           taskTitle: task.title,
           data: extractedData.data
@@ -403,6 +607,13 @@ function TrekOpsApp() {
       
       // Ignore common environment-related WebSocket errors that are benign
       if (reason.includes('WebSocket') || reason.includes('HMR')) {
+        return;
+      }
+
+      // Ignore internal Firebase assertions that are often transient or benign
+      const upperReason = reason.toUpperCase();
+      if (upperReason.includes('INTERNAL ASSERTION FAILED') || upperReason.includes('PENDING PROMISE WAS NEVER SET')) {
+        console.warn('Ignoring internal Firebase assertion error:', reason);
         return;
       }
       
@@ -446,13 +657,21 @@ function TrekOpsApp() {
     async function testConnection() {
       try {
         console.log('Testing Firestore connection...');
-        await getDocFromServer(doc(db, 'test', 'connection'));
+        // Use getDoc instead of getDocFromServer to be more resilient to internal assertions
+        // while still triggering a network request on first load.
+        await getDoc(doc(db, 'test', 'connection'));
         setIsFirestoreOffline(false);
         console.log('Firestore connection test successful.');
       } catch (error) {
-        if (error instanceof Error && (error.message.includes('the client is offline') || error.message.includes('Could not reach Cloud Firestore backend'))) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (message.includes('the client is offline') || message.includes('Could not reach Cloud Firestore backend')) {
           console.error("Firestore is offline or unreachable.");
           setIsFirestoreOffline(true);
+        } else if (message.includes('INTERNAL ASSERTION FAILED')) {
+          console.warn("Caught internal assertion during connection test:", message);
+          // Don't mark as offline, just log it
+        } else {
+          console.error("Firestore connection test error:", error);
         }
       }
     }
@@ -511,25 +730,25 @@ function TrekOpsApp() {
 
   // Fetch Tasks
   useEffect(() => {
-    if (!isAuthReady || !user || !selectedTrek) return;
+    if (!isAuthReady || !user) return;
 
-    const q = query(
-      collection(db, 'tasks'), 
-      where('trekId', '==', selectedTrek.id)
-    );
+    // Fetch all tasks so progress indicators work in list views
+    const q = query(collection(db, 'tasks'));
     
     const unsubscribe = onSnapshot(q, (snapshot) => {
+      console.log(`App: Received ${snapshot.docs.length} tasks from Firestore`);
       const taskData = snapshot.docs.map(doc => ({
         id: doc.id,
         ...doc.data()
       })) as Task[];
       setTasks(taskData);
+      setTasksLoaded(true);
     }, (error) => {
       handleFirestoreError(error, OperationType.LIST, 'tasks');
     });
 
     return () => unsubscribe();
-  }, [isAuthReady, user, selectedTrek]);
+  }, [isAuthReady, user]);
 
   // Fetch Staff
   useEffect(() => {
@@ -559,75 +778,87 @@ function TrekOpsApp() {
   }, [isAuthReady, user]);
 
   const parseTrekDate = (date: any): Date => {
-    if (!date) return new Date(0);
-    
-    // Handle Firestore Timestamp
-    if (typeof date === 'object' && date !== null && 'seconds' in date) {
-      return new Date(date.seconds * 1000);
-    }
-    if (date.toDate && typeof date.toDate === 'function') {
-      return date.toDate();
-    }
-    
-    // Handle string or number
-    let d = new Date(date);
-    if (!isNaN(d.getTime())) return d;
-    
-    // Handle DD-MMM-YYYY manually (e.g., 13-Mar-2026)
-    if (typeof date === 'string') {
-      const clean = date.trim();
-      const parts = clean.split(/[-/.]/);
-      if (parts.length === 3) {
-        let [day, month, year] = parts;
-        // If year is first (YYYY-MM-DD), parts[0] is year
-        if (day.length === 4) {
-          [year, month, day] = [day, month, day];
-        }
-        
-        const monthMap: Record<string, string> = {
-          jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06',
-          jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12'
-        };
-        
-        if (isNaN(Number(month))) {
-          month = monthMap[month.toLowerCase().substring(0, 3)] || '01';
-        }
-        
-        const fullYear = year.length === 2 ? `20${year}` : year;
-        const isoStr = `${fullYear}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
-        d = new Date(isoStr);
-        if (!isNaN(d.getTime())) return d;
+    try {
+      if (!date) return new Date(0);
+      
+      // Handle Firestore Timestamp
+      if (typeof date === 'object' && date !== null && 'seconds' in date) {
+        return new Date(date.seconds * 1000);
       }
+      if (date && typeof date.toDate === 'function') {
+        return date.toDate();
+      }
+      
+      // Handle string or number
+      let d = new Date(date);
+      if (!isNaN(d.getTime())) return d;
+      
+      // Handle DD-MMM-YYYY manually (e.g., 13-Mar-2026)
+      if (typeof date === 'string') {
+        const clean = date.trim();
+        const parts = clean.split(/[-/.]/);
+        if (parts.length === 3) {
+          let [day, month, year] = parts;
+          // If year is first (YYYY-MM-DD), parts[0] is year
+          if (day.length === 4) {
+            [year, month, day] = [parts[0], parts[1], parts[2]];
+          }
+          
+          const monthMap: Record<string, string> = {
+            jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06',
+            jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12'
+          };
+          
+          if (isNaN(Number(month))) {
+            month = monthMap[month.toLowerCase().substring(0, 3)] || '01';
+          }
+          
+          const fullYear = year.length === 2 ? `20${year}` : year;
+          const isoStr = `${fullYear}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+          d = new Date(isoStr);
+          if (!isNaN(d.getTime())) return d;
+        }
+      }
+      return new Date(0);
+    } catch (e) {
+      console.error("Error parsing date:", date, e);
+      return new Date(0);
     }
-    
-    return new Date(0);
   };
 
   const filteredTreks = useMemo(() => {
-    let filtered = treks;
-    if (selectedRegion) {
-      filtered = filtered.filter(t => t.region === selectedRegion);
-    }
-    
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    
-    if (showCompleted) {
-      filtered = filtered.filter(t => {
-        const date = t.endDate ? parseTrekDate(t.endDate) : parseTrekDate(t.startDate);
-        return date < today;
-      });
-    } else {
-      filtered = filtered.filter(t => {
-        const date = t.endDate ? parseTrekDate(t.endDate) : parseTrekDate(t.startDate);
-        return date >= today;
-      });
-    }
+    try {
+      let filtered = treks;
+      if (selectedRegion) {
+        filtered = filtered.filter(t => {
+          const normalized = normalizeRegion(t.region);
+          return normalized === selectedRegion;
+        });
+      }
+      
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      
+      if (showCompleted) {
+        filtered = filtered.filter(t => {
+          const date = t.endDate ? parseTrekDate(t.endDate) : parseTrekDate(t.startDate);
+          return date < today;
+        });
+      } else {
+        filtered = filtered.filter(t => {
+          const date = t.endDate ? parseTrekDate(t.endDate) : parseTrekDate(t.startDate);
+          return date >= today;
+        });
+      }
 
-    if (typeFilter !== 'All') {
-      filtered = filtered.filter(t => t.type === typeFilter);
+      if (typeFilter !== 'All') {
+        filtered = filtered.filter(t => t.type === typeFilter);
+      }
+      return filtered;
+    } catch (e) {
+      console.error("Error filtering treks:", e);
+      return [];
     }
-    return filtered;
   }, [treks, selectedRegion, typeFilter, showCompleted]);
 
   const isReadOnly = useMemo(() => {
@@ -677,6 +908,9 @@ function TrekOpsApp() {
     setUploadProgress(0);
     
     try {
+      const task = tasks.find(t => t.id === taskId);
+      if (!task) return;
+
       const storageRef = ref(storage, `tasks/${taskId}/${file.name}`);
       const uploadTask = uploadBytesResumable(storageRef, file);
       
@@ -692,7 +926,22 @@ function TrekOpsApp() {
         }, 
         async () => {
           const downloadURL = await getDownloadURL(uploadTask.snapshot.ref);
-          await updateTaskValue(taskId, 'fileUrl', downloadURL);
+          
+          const isMultiUpload = task.category === 'Kitchen' || task.category === 'Equipment';
+          
+          if (isMultiUpload) {
+            const currentFiles = task.files || [];
+            const newFiles = [...currentFiles, { url: downloadURL, name: file.name }];
+            await updateTaskValue(taskId, 'files', newFiles);
+            // Also update fileUrl for backward compatibility/legacy UI
+            if (!task.fileUrl) {
+              await updateTaskValue(taskId, 'fileUrl', downloadURL);
+            }
+          } else {
+            await updateTaskValue(taskId, 'fileUrl', downloadURL);
+            await updateTaskValue(taskId, 'files', [{ url: downloadURL, name: file.name }]);
+          }
+          
           setUploadingTaskId(null);
           setUploadProgress(0);
         }
@@ -706,6 +955,9 @@ function TrekOpsApp() {
 
   const handleDeleteFile = async (taskId: string, fileUrl: string) => {
     try {
+      const task = tasks.find(t => t.id === taskId);
+      if (!task) return;
+
       // Create a reference to the file to delete
       const fileRef = ref(storage, fileUrl);
       
@@ -713,13 +965,29 @@ function TrekOpsApp() {
       await deleteObject(fileRef);
       
       // Update the task in Firestore
-      await updateTaskValue(taskId, 'fileUrl', null);
+      const currentFiles = task.files || [];
+      const newFiles = currentFiles.filter(f => f.url !== fileUrl);
+      
+      await updateTaskValue(taskId, 'files', newFiles);
+      
+      // If we deleted the main fileUrl, update it to the next available file or null
+      if (task.fileUrl === fileUrl) {
+        await updateTaskValue(taskId, 'fileUrl', newFiles.length > 0 ? newFiles[0].url : null);
+      }
       
       console.log('File deleted successfully');
     } catch (error) {
       console.error('Error deleting file:', error);
       // Even if storage delete fails (e.g. file already gone), we still want to clear the reference in Firestore
-      await updateTaskValue(taskId, 'fileUrl', null);
+      const task = tasks.find(t => t.id === taskId);
+      if (task) {
+        const currentFiles = task.files || [];
+        const newFiles = currentFiles.filter(f => f.url !== fileUrl);
+        await updateTaskValue(taskId, 'files', newFiles);
+        if (task.fileUrl === fileUrl) {
+          await updateTaskValue(taskId, 'fileUrl', newFiles.length > 0 ? newFiles[0].url : null);
+        }
+      }
     }
   };
 
@@ -736,7 +1004,21 @@ function TrekOpsApp() {
   };
 
   const handleScanAndSave = async (task: Task) => {
-    if (!task.fileUrl) return;
+    console.log("--- handleScanAndSave triggered ---");
+    console.log("Task:", task.title);
+    
+    // Check both possible file locations
+    const urls = [
+      ...(task.files?.map(f => f.url) || []),
+      ...(task.fileUrl ? [task.fileUrl] : [])
+    ];
+    
+    console.log("Detected URLs:", urls);
+
+    if (urls.length === 0) {
+      alert("No files found to scan. Please upload an image first.");
+      return;
+    }
     
     setIsScanning(true);
     setScanningTask(task);
@@ -745,27 +1027,64 @@ function TrekOpsApp() {
     setIsScanModalOpen(true);
 
     try {
-      setIsScanning(true);
-      setScanError(null);
-      setScanResults(null);
+      // 1. Fetch all images and convert to base64
+      console.log("Fetching images for frontend extraction (via proxy)...");
+      const imageParts = await Promise.all(urls.map(async (url, index) => {
+        const proxyUrl = `/api/proxy-image?url=${encodeURIComponent(url)}`;
+        const response = await fetch(proxyUrl);
+        if (!response.ok) throw new Error(`Failed to fetch image ${index + 1}`);
+        const blob = await response.blob();
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onloadend = () => {
+            const base64Data = (reader.result as string).split(',')[1];
+            resolve({
+              inlineData: {
+                data: base64Data,
+                mimeType: blob.type || "image/jpeg"
+              }
+            });
+          };
+          reader.onerror = reject;
+          reader.readAsDataURL(blob);
+        });
+      }));
 
-      // 1. Send the file URL to our backend for extraction
-      const response = await fetch('/api/extract-data', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ fileUrl: task.fileUrl })
+      // 2. Initialize Gemini (Frontend uses process.env.GEMINI_API_KEY)
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY as string });
+      
+      console.log("Calling Gemini API from frontend...");
+      const result = await ai.models.generateContent({
+        model: "gemini-3-flash-preview",
+        contents: [
+          {
+            parts: [
+              { text: "Extract the items, quantities, and any prices from these lists/images. Return the data as a single combined JSON array of objects with keys: 'item' (string), 'quantity' (string), and 'unit_price' (number, optional). If a price is not found, omit the key. Focus on making the list clean and readable. Combine duplicates if they are clearly the same item." },
+              ...(imageParts as any[])
+            ]
+          }
+        ],
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                item: { type: Type.STRING },
+                quantity: { type: Type.STRING },
+                unit_price: { type: Type.NUMBER }
+              },
+              required: ["item", "quantity"]
+            }
+          }
+        }
       });
 
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.error || 'Failed to extract data from image.');
-      }
+      if (!result.text) throw new Error("Gemini returned an empty response.");
 
-      const { data } = await response.json();
-      if (!Array.isArray(data) || data.length === 0) {
-        throw new Error('No items were found in the image.');
-      }
-      
+      const data = JSON.parse(result.text);
+      console.log("Frontend extraction successful:", data);
       setScanResults(data);
     } catch (error: any) {
       console.error('Scanning error:', error);
@@ -842,7 +1161,9 @@ function TrekOpsApp() {
       await deleteDoc(doc(db, 'treks', trekId));
       
       // Delete associated tasks
-      const trekTasks = tasks.filter(t => t.trekId === trekId);
+      const trek = treks.find(t => t.id === trekId);
+      const stableTrekId = trek ? getStableTrekId(trek) : trekId;
+      const trekTasks = tasks.filter(t => isTaskRelatedToTrek(t, trekId, stableTrekId));
       const deletePromises = trekTasks.map(t => deleteDoc(doc(db, 'tasks', t.id)));
       await Promise.all(deletePromises);
       
@@ -853,30 +1174,70 @@ function TrekOpsApp() {
     }
   };
 
-  const getTrekDateString = (date: any): string => {
-    const d = parseTrekDate(date);
-    if (isNaN(d.getTime()) || d.getTime() === 0) return 'no-date';
-    // Use local date parts to avoid timezone shifts in toISOString
-    const year = d.getFullYear();
-    const month = String(d.getMonth() + 1).padStart(2, '0');
-    const day = String(d.getDate()).padStart(2, '0');
-    return `${year}-${month}-${day}`;
-  };
+  useEffect(() => {
+    if (treks.length > 0 && tasks.length > 0) {
+      const missingHorseman = treks.filter(trek => {
+        const stableTrekId = getStableTrekId(trek);
+        const trekTasks = tasks.filter(t => isTaskRelatedToTrek(t, trek.id, stableTrekId));
+        return !trekTasks.some(t => t.title === 'Horseman' && t.category === 'Team Assigned');
+      });
+      if (missingHorseman.length > 0) {
+        console.log("TREKS MISSING HORSEMAN TASK:", missingHorseman.map(t => `${t.name} (${t.startDate})`).join(", "));
+      } else {
+        console.log("ALL TREKS HAVE HORSEMAN TASK");
+      }
+    }
+  }, [treks, tasks]);
 
-  const normalizeRegion = (region: string): string => {
-    if (!region) return 'Nepal';
-    const r = region.toUpperCase().trim().replace(/_/g, ' ');
-    if (r.includes('HIMACHAL')) return 'Himachal';
-    if (r.includes('UTTARAKHAND')) return 'Uttarakhand';
-    if (r.includes('LADAKH')) return 'Ladakh';
-    if (r.includes('KASHMIR')) return 'Kashmir';
-    if (r.includes('SIKKIM')) return 'Sikkim';
-    if (r.includes('BHUTAN')) return 'Bhutan';
-    if (r.includes('NEPAL')) return 'Nepal';
-    
-    // Default to Title Case if not matched
-    return region.charAt(0).toUpperCase() + region.slice(1).toLowerCase();
-  };
+  const [isSyncing, setIsSyncing] = useState(false);
+
+  useEffect(() => {
+    if (selectedTrek && tasksLoaded && !isSyncing) {
+      const stableTrekId = getStableTrekId(selectedTrek);
+      const trekTasks = tasks.filter(t => isTaskRelatedToTrek(t, selectedTrek.id, stableTrekId));
+      const categories: Category[] = ['Transport', 'Permits', 'Equipment', 'Kitchen', 'Team Assigned', 'Field Accounts'];
+      
+      const sync = async () => {
+        setIsSyncing(true);
+        try {
+          for (const category of categories) {
+            const templates = TASK_TEMPLATES[category] || [];
+            for (const template of templates) {
+              const taskStableId = getTaskStableId(stableTrekId, template.title);
+              const existingTask = trekTasks.find(t => 
+                t.id === taskStableId || 
+                (t.title.toLowerCase().trim() === template.title.toLowerCase().trim() && t.category === category)
+              );
+
+              if (!existingTask) {
+                console.log(`Creating missing task: ${template.title}`);
+                await setDoc(doc(db, 'tasks', taskStableId), {
+                  id: taskStableId,
+                  trekId: stableTrekId,
+                  category,
+                  ...template,
+                  status: 'pending',
+                  createdAt: serverTimestamp()
+                }, { merge: true });
+              } else {
+                // Task exists, ensure it's linked to the stable trek ID
+                if (existingTask.trekId !== stableTrekId) {
+                  console.log(`Claiming task ${existingTask.id} for trek ${stableTrekId}`);
+                  await updateDoc(doc(db, 'tasks', existingTask.id), { trekId: stableTrekId });
+                }
+              }
+            }
+          }
+        } catch (err) {
+          console.error("Sync error:", err);
+        } finally {
+          setIsSyncing(false);
+        }
+      };
+
+      sync();
+    }
+  }, [selectedTrek?.id, tasksLoaded]);
 
   const handleCreateTrek = async (e?: React.FormEvent, tripData?: SalesTrip) => {
     if (e) e.preventDefault();
@@ -887,9 +1248,7 @@ function TrekOpsApp() {
     
     // Generate Stable ID: trek-[name-slug]-[date]
     // This ensures that the same trek on the same date always has the same ID, preventing duplicates.
-    const trekNameSlug = data.name.toLowerCase().trim().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
-    const trekDateStr = getTrekDateString(data.startDate);
-    const stableId = `trek-${trekNameSlug}-${trekDateStr}`;
+    const stableId = getStableTrekId(data);
     
     try {
       console.log(`Creating/Updating trek with stable ID: ${stableId}`);
@@ -911,8 +1270,7 @@ function TrekOpsApp() {
         const templates = TASK_TEMPLATES[category] || [];
         templates.forEach(template => {
           // Generate Stable ID for tasks too: task-[trek-id]-[task-title-slug]
-          const taskNameSlug = template.title.toLowerCase().trim().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
-          const taskStableId = `task-${stableId}-${taskNameSlug}`;
+          const taskStableId = getTaskStableId(stableId, template.title);
           
           taskPromises.push(setDoc(doc(db, 'tasks', taskStableId), {
             id: taskStableId,
@@ -1043,7 +1401,14 @@ function TrekOpsApp() {
     }
   };
 
+
+
+  const [isLoggingIn, setIsLoggingIn] = useState(false);
+
   const handleLogin = async () => {
+    if (isLoggingIn || !isAuthReady) return;
+    setIsLoggingIn(true);
+    setTreksError(null); // Clear any previous errors
     try {
       const provider = new GoogleAuthProvider();
       // Force account selection to help with multi-account issues
@@ -1053,18 +1418,28 @@ function TrekOpsApp() {
       console.error('Login Error:', error);
       if (error.code === 'auth/popup-blocked') {
         alert("The login popup was blocked by your browser. Please allow popups.");
-      } else if (error.code === 'auth/cancelled-by-user') {
-        // Ignore
+      } else if (error.code === 'auth/cancelled-by-user' || error.code === 'auth/popup-closed-by-user') {
+        // Ignore user-initiated cancellations
+        console.log('Login cancelled by user');
       } else {
         setTreksError(`Login failed: ${error.message}.`);
       }
+    } finally {
+      setIsLoggingIn(false);
     }
   };
 
   const handleLogout = () => signOut(auth);
 
   const stats = useMemo(() => {
-    const activeTreks = treks.filter(t => t.status === 'active');
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    
+    const activeTreks = treks.filter(t => {
+      const date = t.endDate ? parseTrekDate(t.endDate) : parseTrekDate(t.startDate);
+      return date >= today;
+    });
+    
     return {
       totalTreks: treks.length,
       activeTrips: activeTreks.length,
@@ -1074,9 +1449,16 @@ function TrekOpsApp() {
   }, [treks, tasks, selectedTrek]);
 
   const regionStats = useMemo(() => {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    
     return REGIONS.map(region => {
-      const regionTreks = treks.filter(t => t.region === region);
-      const active = regionTreks.filter(t => t.status === 'active').length;
+      const regionTreks = treks.filter(t => normalizeRegion(t.region) === region);
+      const active = regionTreks.filter(t => {
+        const date = t.endDate ? parseTrekDate(t.endDate) : parseTrekDate(t.startDate);
+        return date >= today;
+      }).length;
+      
       return {
         name: region,
         active,
@@ -1091,8 +1473,11 @@ function TrekOpsApp() {
     const cats: Category[] = ['Transport', 'Permits', 'Equipment', 'Kitchen', 'Team Assigned', 'Field Accounts'];
     const progress: Record<string, { completed: number; total: number }> = {};
     
+    const stableTrekId = getStableTrekId(selectedTrek);
+    const trekTasks = tasks.filter(t => isTaskRelatedToTrek(t, selectedTrek.id, stableTrekId));
+    
     cats.forEach(cat => {
-      const catTasks = tasks.filter(t => t.category === cat);
+      const catTasks = trekTasks.filter(t => t.category === cat);
       progress[cat] = {
         completed: catTasks.filter(t => t.status === 'completed' || t.isNA).length,
         total: catTasks.length
@@ -1102,12 +1487,38 @@ function TrekOpsApp() {
   }, [tasks, selectedTrek]);
 
   const overallProgress = useMemo(() => {
-    if (tasks.length === 0) return 0;
-    const completed = tasks.filter(t => t.status === 'completed' || t.isNA).length;
-    return Math.round((completed / tasks.length) * 100);
-  }, [tasks]);
+    if (!selectedTrek || tasks.length === 0) return 0;
+    const stableTrekId = getStableTrekId(selectedTrek);
+    const trekTasks = tasks.filter(t => isTaskRelatedToTrek(t, selectedTrek.id, stableTrekId));
+    if (trekTasks.length === 0) return 0;
+    const completed = trekTasks.filter(t => t.status === 'completed' || t.isNA).length;
+    return Math.round((completed / trekTasks.length) * 100);
+  }, [tasks, selectedTrek]);
 
   if (treksError) {
+    const isNetworkError = treksError.includes('network-request-failed') || treksError.includes('offline');
+    
+    if (isNetworkError && user) {
+      // For network errors when already logged in, show a non-blocking banner instead of full screen
+      return (
+        <div className="min-h-screen bg-slate-50 flex flex-col">
+          <div className="bg-amber-500 text-white px-4 py-2 text-center text-xs font-bold flex items-center justify-center gap-2">
+            <WifiOff className="w-3 h-3" />
+            Network connection issue. Some data may not be up to date.
+            <button onClick={() => setTreksError(null)} className="underline ml-2">Dismiss</button>
+          </div>
+          {/* Render the rest of the app if possible, or a simplified version */}
+          <div className="flex-1 flex items-center justify-center p-6 text-center">
+             <div className="max-w-md">
+               <h1 className="text-xl font-bold mb-2">Connection Issue</h1>
+               <p className="text-sm text-slate-500 mb-6">We're having trouble reaching the database. This is usually temporary.</p>
+               <button onClick={() => window.location.reload()} className="bg-emerald-600 text-white px-6 py-2 rounded-lg font-bold">Retry Connection</button>
+             </div>
+          </div>
+        </div>
+      );
+    }
+
     return (
       <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-6 text-center">
         <div className="bg-red-100 p-4 rounded-full mb-6">
@@ -1117,12 +1528,23 @@ function TrekOpsApp() {
         <div className="bg-white border border-red-200 p-4 rounded-xl max-w-md mb-8">
           <p className="text-red-600 font-mono text-sm break-words">{treksError}</p>
         </div>
-        <button 
-          onClick={() => window.location.reload()}
-          className="bg-emerald-600 text-white font-bold px-8 py-3 rounded-xl shadow-lg hover:bg-emerald-700 transition-all"
-        >
-          Try Refreshing
-        </button>
+        <div className="flex flex-col sm:flex-row gap-4">
+          <button 
+            onClick={() => window.location.reload()}
+            className="bg-emerald-600 text-white font-bold px-8 py-3 rounded-xl shadow-lg hover:bg-emerald-700 transition-all"
+          >
+            Try Refreshing
+          </button>
+          <button 
+            onClick={() => {
+              localStorage.clear();
+              window.location.reload();
+            }}
+            className="bg-white border border-slate-200 text-slate-600 font-bold px-8 py-3 rounded-xl hover:bg-slate-50 transition-all"
+          >
+            Reset App State
+          </button>
+        </div>
       </div>
     );
   }
@@ -1150,10 +1572,15 @@ function TrekOpsApp() {
         <p className="text-slate-500 mb-10 max-w-xs">Manage your trekking operations with precision and ease.</p>
         <button 
           onClick={handleLogin}
-          className="flex items-center gap-3 bg-white border border-slate-200 text-slate-700 font-bold px-8 py-4 rounded-2xl shadow-sm hover:shadow-md transition-all active:scale-[0.98] mb-6"
+          disabled={isLoggingIn}
+          className="flex items-center gap-3 bg-white border border-slate-200 text-slate-700 font-bold px-8 py-4 rounded-2xl shadow-sm hover:shadow-md transition-all active:scale-[0.98] mb-6 disabled:opacity-50 disabled:cursor-not-allowed"
         >
-          <LogIn className="w-5 h-5 text-emerald-600" />
-          Sign in with Google
+          {isLoggingIn ? (
+            <RefreshCw className="w-5 h-5 text-emerald-600 animate-spin" />
+          ) : (
+            <LogIn className="w-5 h-5 text-emerald-600" />
+          )}
+          {isLoggingIn ? 'Signing in...' : 'Sign in with Google'}
         </button>
 
         <div className="max-w-xs text-center">
@@ -1177,6 +1604,13 @@ function TrekOpsApp() {
             <h1 className="text-xl font-bold tracking-tight">TrekOps</h1>
           </div>
           <div className="flex items-center gap-3">
+            <button 
+              onClick={() => window.open(window.location.origin, '_blank')}
+              className="p-2 text-slate-400 hover:text-emerald-600 hover:bg-emerald-50 rounded-lg transition-colors"
+              title="Open App in New Tab (More Stable for Drive)"
+            >
+              <ExternalLink className="w-4 h-4" />
+            </button>
             {isAdminMode && (
               <div className="flex items-center gap-2">
                 <button 
@@ -1188,6 +1622,7 @@ function TrekOpsApp() {
                 </button>
                 <button 
                   onClick={handleConnectGoogle}
+                  disabled={isRefreshingStatus}
                   className={`px-3 py-2 rounded-xl transition-all flex items-center gap-2 border shadow-sm ${
                     isGoogleConnected 
                       ? 'bg-emerald-50 border-emerald-200 text-emerald-600 hover:bg-emerald-100' 
@@ -1196,12 +1631,26 @@ function TrekOpsApp() {
                   title={isGoogleConnected ? "Google Drive Connected" : "Connect Google Drive"}
                 >
                   <div className="w-5 h-5 flex items-center justify-center bg-white rounded-lg shadow-sm border border-slate-100">
-                    <Cloud className="w-3.5 h-3.5 text-blue-500" />
+                    {isRefreshingStatus ? (
+                      <RefreshCw className="w-3.5 h-3.5 text-emerald-500 animate-spin" />
+                    ) : (
+                      <Cloud className={`w-3.5 h-3.5 ${isGoogleConnected ? 'text-emerald-500' : 'text-blue-500'}`} />
+                    )}
                   </div>
                   <span className="text-[10px] font-bold uppercase tracking-widest hidden sm:inline">
-                    {isGoogleConnected ? "Connected" : "Connect Drive"}
+                    {isRefreshingStatus ? "Checking..." : isGoogleConnected ? "Connected" : "Connect Drive"}
                   </span>
                 </button>
+                {!isGoogleConnected && (
+                  <button 
+                    onClick={() => checkGoogleStatus()}
+                    disabled={isRefreshingStatus}
+                    className="p-2 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-lg transition-colors"
+                    title="Refresh connection status"
+                  >
+                    <RefreshCw className={`w-4 h-4 ${isRefreshingStatus ? 'animate-spin' : ''}`} />
+                  </button>
+                )}
                 {isGoogleConnected && (
                   <button 
                     onClick={async () => {
@@ -1231,6 +1680,13 @@ function TrekOpsApp() {
               title="Refresh Data"
             >
               <RefreshCw className="w-5 h-5" />
+            </button>
+            <button 
+              onClick={() => setShowDebug(!showDebug)}
+              className={`p-2 rounded-lg transition-colors ${showDebug ? 'bg-amber-100 text-amber-600' : 'hover:bg-slate-100 text-slate-400'}`}
+              title="Debug Logs"
+            >
+              <AlertTriangle className="w-5 h-5" />
             </button>
             <button 
               onClick={handleLogout}
@@ -1332,6 +1788,34 @@ function TrekOpsApp() {
                   </div>
                 </div>
               </section>
+
+              {isAdminMode && (
+                <div className="p-6 bg-slate-900 rounded-[2rem] text-white space-y-4 shadow-xl">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <Shield className="w-4 h-4 text-emerald-400" />
+                      <h3 className="text-xs font-black uppercase tracking-[0.2em] text-slate-400">Database Inspector</h3>
+                    </div>
+                    <div className="flex flex-col items-end gap-1">
+                      <div className="px-2 py-0.5 bg-emerald-500/20 text-emerald-400 rounded text-[8px] font-black uppercase">Admin</div>
+                      <div className="text-[6px] text-slate-500 font-mono truncate max-w-[150px]">{db.type === 'firestore' ? (db as any)._databaseId.database : 'default'}</div>
+                    </div>
+                  </div>
+                  
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="bg-white/5 p-4 rounded-2xl border border-white/10">
+                      <div className="text-2xl font-bold">{treks.length}</div>
+                      <div className="text-[8px] font-bold text-slate-500 uppercase tracking-widest mt-1">Raw Treks</div>
+                    </div>
+                    <div className="bg-white/5 p-4 rounded-2xl border border-white/10">
+                      <div className="text-2xl font-bold">{tasks.length}</div>
+                      <div className="text-[8px] font-bold text-slate-500 uppercase tracking-widest mt-1">Raw Tasks</div>
+                    </div>
+                  </div>
+
+
+                </div>
+              )}
 
               <div className="flex items-center justify-center gap-2 py-2">
                 <input 
@@ -1496,7 +1980,7 @@ function TrekOpsApp() {
                         <Mountain className="w-6 h-6" />
                       </div>
                       <div>
-                        <h3 className="font-bold text-slate-800 text-lg leading-tight">{trek.name}</h3>
+                        <h3 className="font-bold text-slate-800 text-lg leading-tight">{trek.name || 'Unnamed Trek'}</h3>
                         <div className="flex items-center gap-3 mt-1.5">
                           <div className="flex items-center gap-1 text-slate-400 text-[10px] font-bold uppercase">
                             <Calendar className="w-3 h-3" />
@@ -1646,25 +2130,32 @@ function TrekOpsApp() {
                   animate={{ opacity: 1, x: 0 }}
                   className="space-y-4"
                 >
-                  {tasks.filter(t => t.category === selectedCategory).length === 0 && (
-                    <div className="text-center py-12 bg-white rounded-3xl border border-dashed border-slate-200">
-                      <p className="text-slate-400 text-sm font-medium">No tasks found in this category.</p>
-                    </div>
-                  )}
-                  {tasks
-                    .filter(t => t.category === selectedCategory)
-                    .sort((a, b) => {
-                      const templates = TASK_TEMPLATES[selectedCategory] || [];
-                      const aIdx = templates.findIndex(t => t.title.toLowerCase().trim() === a.title.toLowerCase().trim());
-                      const bIdx = templates.findIndex(t => t.title.toLowerCase().trim() === b.title.toLowerCase().trim());
-                      
-                      // Put unknown tasks at the end
-                      if (aIdx === -1) return 1;
-                      if (bIdx === -1) return -1;
-                      
-                      return aIdx - bIdx;
-                    })
-                    .map((task, idx) => (
+                  {(() => {
+                    const stableTrekId = getStableTrekId(selectedTrek);
+                    const filteredTasks = tasks
+                      .filter(t => isTaskRelatedToTrek(t, selectedTrek.id, stableTrekId) && t.category === selectedCategory);
+                    
+                    if (filteredTasks.length === 0) {
+                      return (
+                        <div className="text-center py-12 bg-white rounded-3xl border border-dashed border-slate-200">
+                          <p className="text-slate-400 text-sm font-medium">No tasks found in this category.</p>
+                        </div>
+                      );
+                    }
+
+                    return filteredTasks
+                      .sort((a, b) => {
+                        const templates = TASK_TEMPLATES[selectedCategory] || [];
+                        const aIdx = templates.findIndex(t => t.title.toLowerCase().trim() === a.title.toLowerCase().trim());
+                        const bIdx = templates.findIndex(t => t.title.toLowerCase().trim() === b.title.toLowerCase().trim());
+                        
+                        // Put unknown tasks at the end
+                        if (aIdx === -1) return 1;
+                        if (bIdx === -1) return -1;
+                        
+                        return aIdx - bIdx;
+                      })
+                      .map((task, idx) => (
                       <div key={task.id} className="bg-white rounded-3xl border border-slate-100 shadow-sm overflow-hidden">
                       <div 
                         onClick={() => setSelectedTask(selectedTask?.id === task.id ? null : task)}
@@ -1787,7 +2278,7 @@ function TrekOpsApp() {
                                         >
                                           <option value="">Select Driver...</option>
                                           {drivers
-                                            .filter(d => !selectedTrek?.region || d.region === selectedTrek.region)
+                                            .filter(d => !selectedTrek?.region || normalizeRegion(d.region) === normalizeRegion(selectedTrek.region))
                                             .map((d, idx) => <option key={`${d.name}-${idx}`} value={d.name}>{d.name}</option>)}
                                         </select>
                                         <input 
@@ -1850,7 +2341,8 @@ function TrekOpsApp() {
                                           }}
                                         >
                                           <option value="">Select Staff...</option>
-                                          {staff.filter(s => s.role?.toUpperCase() !== 'COOK').map(s => <option key={s.name} value={s.name}>{s.name}</option>)}
+                                          {staff.filter(s => s.role?.toUpperCase() !== 'COOK').map(s => <option key={s.name} value={s.name}>{s.name}</option>)
+                                        }
                                         </select>
                                         <input 
                                           type="text" 
@@ -1899,73 +2391,111 @@ function TrekOpsApp() {
                                       </div>
                                       {task.title !== 'Total Budget' && !isReadOnly && (
                                         <div className="space-y-2">
-                                          {task.fileUrl ? (
-                                            <div className="flex items-center justify-between p-3 bg-emerald-50 border border-emerald-100 rounded-xl">
-                                              <div className="flex items-center gap-2 text-emerald-700">
-                                                <FileText className="w-4 h-4" />
-                                                <span className="text-xs font-bold truncate max-w-[150px]">Voucher Uploaded</span>
-                                              </div>
-                                                  <div className="flex items-center gap-3">
-                                                    {task.isScanned && isGoogleConnected && isAdminMode && (
-                                                      <button
-                                                        onClick={() => handleSyncToSheets(task)}
-                                                        className="flex items-center gap-1 px-2 py-1 bg-blue-600 text-white rounded-lg text-[9px] font-black uppercase tracking-wider hover:bg-blue-700 transition-colors shadow-sm"
-                                                        title="Sync to Google Sheets"
-                                                      >
-                                                        <RefreshCw className={`w-3 h-3 ${isScanning ? 'animate-spin' : ''}`} />
-                                                        Sync
-                                                      </button>
-                                                    )}
-                                                    {isAdminMode && (
-                                                      <button
-                                                        onClick={() => handleScanAndSave(task)}
-                                                        className="flex items-center gap-1 px-2 py-1 bg-emerald-600 text-white rounded-lg text-[9px] font-black uppercase tracking-wider hover:bg-emerald-700 transition-colors shadow-sm"
-                                                        title="AI Scan & Save"
-                                                      >
-                                                        <TrendingUp className="w-3 h-3" />
-                                                        Scan
-                                                      </button>
-                                                    )}
-                                                    <a 
-                                                      href={task.fileUrl} 
-                                                      target="_blank" 
-                                                      rel="noopener noreferrer"
-                                                      className="text-[10px] font-black text-emerald-600 uppercase tracking-widest hover:underline"
-                                                    >
-                                                      View
-                                                    </a>
-                                                    {!isReadOnly && (
-                                                      <button
-                                                        onClick={() => handleDeleteFile(task.id, task.fileUrl)}
-                                                        className="p-1 text-rose-500 hover:bg-rose-100 rounded-lg transition-colors"
-                                                        title="Delete file"
-                                                      >
-                                                        <Trash2 className="w-3.5 h-3.5" />
-                                                      </button>
-                                                    )}
+                                          {/* Render existing files */}
+                                          {(() => {
+                                            const currentFiles = task.files || (task.fileUrl ? [{ url: task.fileUrl, name: 'Voucher' }] : []);
+                                            const limit = (task.category === 'Kitchen' || task.category === 'Equipment') ? 3 : 1;
+                                            
+                                            return (
+                                              <>
+                                                {/* Action Bar for Scan/Sync */}
+                                                {currentFiles.length > 0 && (
+                                                  <div className="flex items-center justify-between mb-2 px-1">
+                                                    <div className="flex items-center gap-2">
+                                                      {task.isScanned && (
+                                                        <div className="flex items-center gap-1 px-2 py-1 bg-blue-100 text-blue-700 rounded-lg text-[9px] font-black uppercase tracking-wider border border-blue-200">
+                                                          <CheckCircle2 className="w-3 h-3" />
+                                                          Scanned
+                                                        </div>
+                                                      )}
+                                                    </div>
+                                                    <div className="flex items-center gap-2">
+                                                      {isAdminMode && (
+                                                        <button
+                                                          onClick={() => handleScanAndSave(task)}
+                                                          className="flex items-center gap-1 px-2 py-1 bg-emerald-600 text-white rounded-lg text-[9px] font-black uppercase tracking-wider hover:bg-emerald-700 transition-colors shadow-sm"
+                                                          title={currentFiles.length > 1 ? "Scan All Files" : "AI Scan & Save"}
+                                                        >
+                                                          <TrendingUp className="w-3 h-3" />
+                                                          {currentFiles.length > 1 ? "Scan All" : "Scan"}
+                                                        </button>
+                                                      )}
+                                                      {task.isScanned && isGoogleConnected && isAdminMode && (
+                                                        <button
+                                                          onClick={() => handleSyncToSheets(task)}
+                                                          className="flex items-center gap-1 px-2 py-1 bg-blue-600 text-white rounded-lg text-[9px] font-black uppercase tracking-wider hover:bg-blue-700 transition-colors shadow-sm"
+                                                          title={currentFiles.length > 1 ? "Sync All to Sheets" : "Sync to Google Sheets"}
+                                                        >
+                                                          <RefreshCw className={`w-3 h-3 ${isScanning ? 'animate-spin' : ''}`} />
+                                                          {currentFiles.length > 1 ? "Sync All" : "Sync"}
+                                                        </button>
+                                                      )}
+                                                    </div>
                                                   </div>
-                                            </div>
-                                          ) : (
-                                            <label className="w-full border-2 border-dashed border-slate-200 rounded-2xl py-3 flex flex-col items-center justify-center gap-2 text-slate-400 hover:border-emerald-300 hover:text-emerald-500 transition-all cursor-pointer">
-                                              <input 
-                                                type="file" 
-                                                className="hidden" 
-                                                accept="image/*,application/pdf"
-                                                onChange={(e) => e.target.files?.[0] && handleFileUpload(task.id, e.target.files[0])}
-                                              />
-                                              {uploadingTaskId === task.id ? (
-                                                <div className="flex flex-col items-center gap-2">
-                                                  <RefreshCw className="w-4 h-4 animate-spin text-emerald-500" />
-                                                  <span className="text-[10px] font-bold text-emerald-600 uppercase tracking-widest">{Math.round(uploadProgress)}%</span>
-                                                </div>
-                                              ) : (
-                                                <>
-                                                  <Upload className="w-4 h-4" />
-                                                  <span className="text-xs font-bold uppercase tracking-wider">Upload cash voucher...</span>
-                                                </>
-                                              )}
-                                            </label>
-                                          )}
+                                                )}
+
+                                                {currentFiles.map((file, fIdx) => (
+                                                  <div key={fIdx} className="flex items-center justify-between p-3 bg-emerald-50 border border-emerald-100 rounded-xl">
+                                                    <div className="flex items-center gap-2 text-emerald-700">
+                                                      <FileText className="w-4 h-4" />
+                                                      <span className="text-xs font-bold truncate max-w-[150px]">{file.name || 'Voucher Uploaded'}</span>
+                                                    </div>
+                                                    <div className="flex items-center gap-3">
+                                                      <a 
+                                                        href={file.url} 
+                                                        target="_blank" 
+                                                        rel="noopener noreferrer"
+                                                        className="text-[10px] font-black text-emerald-600 uppercase tracking-widest hover:underline"
+                                                      >
+                                                        View
+                                                      </a>
+                                                      {!isReadOnly && (
+                                                        <button
+                                                          onClick={() => handleDeleteFile(task.id, file.url)}
+                                                          className="p-1 text-rose-500 hover:bg-rose-100 rounded-lg transition-colors"
+                                                          title="Delete file"
+                                                        >
+                                                          <Trash2 className="w-3.5 h-3.5" />
+                                                        </button>
+                                                      )}
+                                                    </div>
+                                                  </div>
+                                                ))}
+
+                                                {/* Render upload button if limit not reached */}
+                                                {currentFiles.length < limit && (
+                                                  <label className={`w-full border-2 border-dashed border-slate-200 rounded-2xl flex flex-col items-center justify-center gap-2 text-slate-400 hover:border-emerald-300 hover:text-emerald-500 transition-all cursor-pointer ${currentFiles.length > 0 ? 'py-2' : 'py-3'}`}>
+                                                    <input 
+                                                      type="file" 
+                                                      className="hidden" 
+                                                      accept="image/*,application/pdf"
+                                                      onChange={(e) => e.target.files?.[0] && handleFileUpload(task.id, e.target.files[0])}
+                                                    />
+                                                    {uploadingTaskId === task.id ? (
+                                                      <div className="flex flex-col items-center gap-2">
+                                                        <RefreshCw className="w-4 h-4 animate-spin text-emerald-500" />
+                                                        <span className="text-[10px] font-bold text-emerald-600 uppercase tracking-widest">{Math.round(uploadProgress)}%</span>
+                                                      </div>
+                                                    ) : (
+                                                      <>
+                                                        {currentFiles.length > 0 ? (
+                                                          <div className="flex items-center gap-2">
+                                                            <Plus className="w-4 h-4" />
+                                                            <span className="text-[10px] font-bold uppercase tracking-wider">Add another file ({currentFiles.length}/{limit})</span>
+                                                          </div>
+                                                        ) : (
+                                                          <>
+                                                            <Upload className="w-4 h-4" />
+                                                            <span className="text-xs font-bold uppercase tracking-wider">Upload cash voucher...</span>
+                                                          </>
+                                                        )}
+                                                      </>
+                                                    )}
+                                                  </label>
+                                                )}
+                                              </>
+                                            );
+                                          })()}
                                         </div>
                                       )}
                                     </div>
@@ -1973,79 +2503,111 @@ function TrekOpsApp() {
 
                                   {task.type === 'file' && !task.isNA && (
                                     <div className="space-y-2">
-                                      {task.fileUrl ? (
-                                        <div className="flex items-center justify-between p-3 bg-emerald-50 border border-emerald-100 rounded-xl">
-                                          <div className="flex items-center gap-2 text-emerald-700">
-                                            <FileText className="w-4 h-4" />
-                                            <span className="text-xs font-bold truncate max-w-[150px]">File Uploaded</span>
-                                          </div>
-                                          <div className="flex items-center gap-3">
-                                            {task.isScanned && isGoogleConnected && isAdminMode && (
-                                              <button
-                                                onClick={() => handleSyncToSheets(task)}
-                                                className="flex items-center gap-1 px-2 py-1 bg-blue-600 text-white rounded-lg text-[9px] font-black uppercase tracking-wider hover:bg-blue-700 transition-colors shadow-sm"
-                                                title="Sync to Google Sheets"
-                                              >
-                                                <RefreshCw className={`w-3 h-3 ${isScanning ? 'animate-spin' : ''}`} />
-                                                Sync
-                                              </button>
-                                            )}
-                                            {task.isScanned && (
-                                              <div className="flex items-center gap-1 px-2 py-1 bg-blue-100 text-blue-700 rounded-lg text-[9px] font-black uppercase tracking-wider border border-blue-200">
-                                                <CheckCircle2 className="w-3 h-3" />
-                                                Scanned
+                                      {/* Render existing files */}
+                                      {(() => {
+                                        const currentFiles = task.files || (task.fileUrl ? [{ url: task.fileUrl, name: 'File' }] : []);
+                                        const limit = (task.category === 'Kitchen' || task.category === 'Equipment') ? 3 : 1;
+                                        
+                                        return (
+                                          <>
+                                            {/* Action Bar for Scan/Sync */}
+                                            {currentFiles.length > 0 && (
+                                              <div className="flex items-center justify-between mb-2 px-1">
+                                                <div className="flex items-center gap-2">
+                                                  {task.isScanned && (
+                                                    <div className="flex items-center gap-1 px-2 py-1 bg-blue-100 text-blue-700 rounded-lg text-[9px] font-black uppercase tracking-wider border border-blue-200">
+                                                      <CheckCircle2 className="w-3 h-3" />
+                                                      Scanned
+                                                    </div>
+                                                  )}
+                                                </div>
+                                                <div className="flex items-center gap-2">
+                                                  {isAdminMode && (
+                                                    <button
+                                                      onClick={() => handleScanAndSave(task)}
+                                                      className="flex items-center gap-1 px-2 py-1 bg-emerald-600 text-white rounded-lg text-[9px] font-black uppercase tracking-wider hover:bg-emerald-700 transition-colors shadow-sm"
+                                                      title={currentFiles.length > 1 ? "Scan All Files" : "AI Scan & Save"}
+                                                    >
+                                                      <TrendingUp className="w-3 h-3" />
+                                                      {currentFiles.length > 1 ? "Scan All" : "Scan"}
+                                                    </button>
+                                                  )}
+                                                  {task.isScanned && isGoogleConnected && isAdminMode && (
+                                                    <button
+                                                      onClick={() => handleSyncToSheets(task)}
+                                                      className="flex items-center gap-1 px-2 py-1 bg-blue-600 text-white rounded-lg text-[9px] font-black uppercase tracking-wider hover:bg-blue-700 transition-colors shadow-sm"
+                                                      title={currentFiles.length > 1 ? "Sync All to Sheets" : "Sync to Google Sheets"}
+                                                    >
+                                                      <RefreshCw className={`w-3 h-3 ${isScanning ? 'animate-spin' : ''}`} />
+                                                      {currentFiles.length > 1 ? "Sync All" : "Sync"}
+                                                    </button>
+                                                  )}
+                                                </div>
                                               </div>
                                             )}
-                                            {isAdminMode && (
-                                              <button
-                                                onClick={() => handleScanAndSave(task)}
-                                                className="flex items-center gap-1 px-2 py-1 bg-emerald-600 text-white rounded-lg text-[9px] font-black uppercase tracking-wider hover:bg-emerald-700 transition-colors shadow-sm"
-                                                title="AI Scan & Save"
-                                              >
-                                                <TrendingUp className="w-3 h-3" />
-                                                Scan
-                                              </button>
+
+                                            {currentFiles.map((file, fIdx) => (
+                                              <div key={fIdx} className="flex items-center justify-between p-3 bg-emerald-50 border border-emerald-100 rounded-xl">
+                                                <div className="flex items-center gap-2 text-emerald-700">
+                                                  <FileText className="w-4 h-4" />
+                                                  <span className="text-xs font-bold truncate max-w-[150px]">{file.name || 'File Uploaded'}</span>
+                                                </div>
+                                                <div className="flex items-center gap-3">
+                                                  <a 
+                                                    href={file.url} 
+                                                    target="_blank" 
+                                                    rel="noopener noreferrer"
+                                                    className="text-[10px] font-black text-emerald-600 uppercase tracking-widest hover:underline"
+                                                  >
+                                                    View
+                                                  </a>
+                                                  {!isReadOnly && (
+                                                    <button
+                                                      onClick={() => handleDeleteFile(task.id, file.url)}
+                                                      className="p-1 text-rose-500 hover:bg-rose-100 rounded-lg transition-colors"
+                                                      title="Delete file"
+                                                    >
+                                                      <Trash2 className="w-3.5 h-3.5" />
+                                                    </button>
+                                                  )}
+                                                </div>
+                                              </div>
+                                            ))}
+
+                                            {/* Render upload button if limit not reached */}
+                                            {currentFiles.length < limit && (
+                                              <label className={`w-full border-2 border-dashed border-slate-200 rounded-2xl flex flex-col items-center justify-center gap-2 text-slate-400 hover:border-emerald-300 hover:text-emerald-500 transition-all cursor-pointer ${currentFiles.length > 0 ? 'py-2' : 'py-3'}`}>
+                                                <input 
+                                                  type="file" 
+                                                  className="hidden" 
+                                                  accept="image/*,application/pdf"
+                                                  onChange={(e) => e.target.files?.[0] && handleFileUpload(task.id, e.target.files[0])}
+                                                />
+                                                {uploadingTaskId === task.id ? (
+                                                  <div className="flex flex-col items-center gap-2">
+                                                    <RefreshCw className="w-4 h-4 animate-spin text-emerald-500" />
+                                                    <span className="text-[10px] font-bold text-emerald-600 uppercase tracking-widest">{Math.round(uploadProgress)}%</span>
+                                                  </div>
+                                                ) : (
+                                                  <>
+                                                    {currentFiles.length > 0 ? (
+                                                      <div className="flex items-center gap-2">
+                                                        <Plus className="w-4 h-4" />
+                                                        <span className="text-[10px] font-bold uppercase tracking-wider">Add another file ({currentFiles.length}/{limit})</span>
+                                                      </div>
+                                                    ) : (
+                                                      <>
+                                                        <Upload className="w-4 h-4" />
+                                                        <span className="text-xs font-bold uppercase tracking-wider">Choose file...</span>
+                                                      </>
+                                                    )}
+                                                  </>
+                                                )}
+                                              </label>
                                             )}
-                                            <a 
-                                              href={task.fileUrl} 
-                                              target="_blank" 
-                                              rel="noopener noreferrer"
-                                              className="text-[10px] font-black text-emerald-600 uppercase tracking-widest hover:underline"
-                                            >
-                                              View
-                                            </a>
-                                            {!isReadOnly && (
-                                              <button
-                                                onClick={() => handleDeleteFile(task.id, task.fileUrl)}
-                                                className="p-1 text-rose-500 hover:bg-rose-100 rounded-lg transition-colors"
-                                                title="Delete file"
-                                              >
-                                                <Trash2 className="w-3.5 h-3.5" />
-                                              </button>
-                                            )}
-                                          </div>
-                                        </div>
-                                      ) : !isReadOnly && (
-                                        <label className="w-full border-2 border-dashed border-slate-200 rounded-2xl py-3 flex flex-col items-center justify-center gap-2 text-slate-400 hover:border-emerald-300 hover:text-emerald-500 transition-all cursor-pointer">
-                                          <input 
-                                            type="file" 
-                                            className="hidden" 
-                                            accept="image/*,application/pdf"
-                                            onChange={(e) => e.target.files?.[0] && handleFileUpload(task.id, e.target.files[0])}
-                                          />
-                                          {uploadingTaskId === task.id ? (
-                                            <div className="flex flex-col items-center gap-2">
-                                              <RefreshCw className="w-4 h-4 animate-spin text-emerald-500" />
-                                              <span className="text-[10px] font-bold text-emerald-600 uppercase tracking-widest">{Math.round(uploadProgress)}%</span>
-                                            </div>
-                                          ) : (
-                                            <>
-                                              <Upload className="w-4 h-4" />
-                                              <span className="text-xs font-bold uppercase tracking-wider">Choose file...</span>
-                                            </>
-                                          )}
-                                        </label>
-                                      )}
+                                          </>
+                                        );
+                                      })()}
                                     </div>
                                   )}
 
@@ -2070,6 +2632,8 @@ function TrekOpsApp() {
                                         <option value="">Select {task.title}...</option>
                                         {task.category === 'Team Assigned' && task.title === 'Cook' 
                                           ? staff.filter(s => s.role?.toUpperCase() === 'COOK').map(s => <option key={s.name} value={s.name}>{s.name}</option>)
+                                          : task.category === 'Team Assigned' && task.title === 'Horseman'
+                                          ? staff.filter(s => s.role?.toUpperCase().includes('HORSEMAN') && (!selectedTrek?.region || normalizeRegion(s.region) === normalizeRegion(selectedTrek.region))).map(s => <option key={s.name} value={s.name}>{s.name}</option>)
                                           : task.category === 'Team Assigned' && task.title === 'Trip Leader'
                                           ? staff.filter(s => s.role?.toUpperCase() !== 'COOK').map(s => <option key={s.name} value={s.name}>{s.name}</option>)
                                           : task.options?.map(opt => <option key={opt} value={opt}>{opt}</option>)
@@ -2119,7 +2683,7 @@ function TrekOpsApp() {
                         )}
                       </AnimatePresence>
                     </div>
-                  ))}
+                  ))})()}
                 </motion.div>
               )}
             </motion.div>
@@ -2647,6 +3211,105 @@ function TrekOpsApp() {
       </AnimatePresence>
 
       {/* Bottom Nav Removed */}
+      
+      {/* Debug Overlay */}
+      {showDebug && (
+        <div className="fixed bottom-4 right-4 z-[100] w-80 bg-white rounded-2xl shadow-2xl border border-slate-200 overflow-hidden flex flex-col max-h-[400px]">
+          <div className="p-3 bg-slate-900 text-white flex justify-between items-center">
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 text-amber-400" />
+              <span className="text-xs font-bold uppercase tracking-wider">Debug Console</span>
+            </div>
+            <button onClick={() => setShowDebug(false)} className="text-slate-400 hover:text-white">
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+          <div className="flex-1 overflow-y-auto p-3 space-y-2">
+            <div className="p-2 bg-slate-50 rounded-lg border border-slate-100 space-y-1">
+              <div className="text-[9px] font-bold text-slate-400 uppercase">Environment</div>
+              <div className="text-[10px] font-mono text-slate-600 break-all">UID: {user?.uid}</div>
+              <div className="text-[10px] font-mono text-slate-600 break-all">DB: {dbId}</div>
+              <div className="text-[10px] font-mono text-slate-600 flex items-center gap-1">
+                Backend: 
+                {backendStatus ? (
+                  <span className="text-emerald-600 font-bold">ONLINE</span>
+                ) : (
+                  <span className="text-rose-600 font-bold">OFFLINE</span>
+                )}
+              </div>
+              {backendStatus && (
+                <div className="text-[8px] text-slate-400">
+                  Last: {new Date(backendStatus.last_startup).toLocaleTimeString()}
+                </div>
+              )}
+            </div>
+            <div className="flex items-center justify-between">
+              <div className="text-[9px] font-bold text-slate-400 uppercase">Logs</div>
+              <button 
+                onClick={async () => {
+                  try {
+                    const res = await fetch('/api/debug/clear', { method: 'POST' });
+                    if (!res.ok) {
+                      const errText = await res.text();
+                      throw new Error(errText);
+                    }
+                    setDebugLogs([]);
+                    alert("Logs cleared successfully!");
+                  } catch (e: any) {
+                    console.error("Failed to clear logs:", e);
+                    alert("Failed to clear logs: " + e.message);
+                  }
+                }}
+                className="text-[9px] text-rose-500 hover:text-rose-600 font-bold"
+              >
+                Clear
+              </button>
+            </div>
+            {debugLogs.length === 0 ? (
+              <div className="text-center py-8 text-slate-400 text-xs italic">No logs found yet...</div>
+            ) : (
+              debugLogs.map((log: any) => (
+                <div key={log.id} className="p-2 bg-slate-50 rounded-lg border border-slate-100">
+                  <div className="text-[10px] font-bold text-slate-800">{log.message}</div>
+                  <div className="text-[9px] text-slate-500">{new Date(log.timestamp).toLocaleTimeString()}</div>
+                  {log.data && (
+                    <pre className="text-[8px] mt-1 bg-white p-1 rounded border border-slate-200 overflow-x-auto">
+                      {JSON.stringify(log.data, null, 2)}
+                    </pre>
+                  )}
+                </div>
+              ))
+            )}
+          </div>
+          <div className="p-2 bg-slate-50 border-t border-slate-200 space-y-2">
+            <button 
+              onClick={async () => {
+                if (!user) return;
+                console.log("Testing Firestore write...");
+                try {
+                  await setDoc(doc(db, "users", user.uid), { lastTest: new Date().toISOString() }, { merge: true });
+                  console.log("Firestore write test successful!");
+                  alert("✅ Firestore Write: SUCCESS");
+                } catch (e) {
+                  console.error("Firestore write test failed:", e);
+                  alert(`❌ Firestore Write: FAILED\n${e instanceof Error ? e.message : 'Unknown error'}`);
+                }
+              }}
+              className="w-full py-2 bg-emerald-600 text-white rounded-xl text-[10px] font-bold hover:bg-emerald-700 transition-colors shadow-sm"
+            >
+              Test Firestore Write
+            </button>
+            <button 
+              onClick={() => checkGoogleStatus()}
+              className="w-full py-2 bg-white border border-slate-200 rounded-xl text-[10px] font-bold text-slate-600 hover:bg-slate-100 transition-colors"
+            >
+              Force Status Check
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Debug Toggle (Hidden trigger removed, now using header button) */}
     </div>
   );
 }
