@@ -344,6 +344,7 @@ interface TrekInstance {
   location: string;
   status: 'planning' | 'active' | 'completed';
   createdAt?: any;
+  salesTripId?: string;
 }
 
 // --- Main App ---
@@ -391,6 +392,8 @@ function TrekOpsApp() {
   const [drivers, setDrivers] = useState<Driver[]>([]);
   const [vehicles, setVehicles] = useState<Vehicle[]>([]);
   const [isLoadingSales, setIsLoadingSales] = useState(false);
+  const [isRefreshingPax, setIsRefreshingPax] = useState(false);
+  const [paxUpdateMessage, setPaxUpdateMessage] = useState<{ text: string, type: 'success' | 'error' } | null>(null);
   const [isImporting, setIsImporting] = useState(false);
   const [salesError, setSalesError] = useState<string | null>(null);
   const [showCompletedSales, setShowCompletedSales] = useState(false);
@@ -1260,7 +1263,8 @@ function TrekOpsApp() {
         id: stableId, // Ensure ID is stored in the document too
         status: 'active',
         createdAt: serverTimestamp(),
-        createdBy: user?.uid
+        createdBy: user?.uid,
+        salesTripId: tripData?.id
       });
 
       const categories: Category[] = ['Transport', 'Permits', 'Equipment', 'Kitchen', 'Team Assigned', 'Field Accounts'];
@@ -1357,6 +1361,59 @@ function TrekOpsApp() {
     } finally {
       clearTimeout(importTimeout);
       setIsImporting(false);
+    }
+  };
+
+  const refreshPaxData = async () => {
+    if (isRefreshingPax) return;
+    
+    setPaxUpdateMessage(null);
+    setIsRefreshingPax(true);
+    console.log('refreshPaxData: Starting sync...');
+
+    try {
+      const salesData = await fetchSalesTrips();
+      console.log(`refreshPaxData: Fetched ${salesData.length} trips from sales.`);
+      
+      let updateCount = 0;
+      const batch = writeBatch(db);
+
+      for (const trek of treks) {
+        // Try to match by salesTripId first, then by stable ID
+        const matchingTrip = salesData.find(s => 
+          (trek.salesTripId && s.id === trek.salesTripId) || 
+          (s.id === trek.id)
+        );
+
+        if (matchingTrip) {
+          const salesPax = Number(matchingTrip.pax);
+          const currentPax = Number(trek.pax);
+          
+          if (salesPax !== currentPax) {
+            console.log(`refreshPaxData: Updating ${trek.name} pax from ${currentPax} to ${salesPax}`);
+            const trekRef = doc(db, 'treks', trek.id);
+            batch.update(trekRef, { 
+              pax: salesPax,
+              salesTripId: matchingTrip.id // Ensure we save the ID for future syncs
+            });
+            updateCount++;
+          }
+        }
+      }
+
+      if (updateCount > 0) {
+        await batch.commit();
+        setPaxUpdateMessage({ text: `Successfully updated pax for ${updateCount} treks!`, type: 'success' });
+      } else {
+        setPaxUpdateMessage({ text: "All pax counts are already up to date.", type: 'success' });
+      }
+    } catch (error: any) {
+      console.error("Error refreshing pax data:", error);
+      setPaxUpdateMessage({ text: `Failed to refresh: ${error.message}`, type: 'error' });
+    } finally {
+      setIsRefreshingPax(false);
+      // Clear message after 5 seconds
+      setTimeout(() => setPaxUpdateMessage(null), 5000);
     }
   };
 
@@ -1674,13 +1731,33 @@ function TrekOpsApp() {
             >
               <Shield className="w-5 h-5" />
             </button>
-            <button 
-              onClick={() => window.location.reload()}
-              className="p-2 hover:bg-slate-100 rounded-lg text-slate-400 transition-colors"
-              title="Refresh Data"
-            >
-              <RefreshCw className="w-5 h-5" />
-            </button>
+            <div className="relative">
+              <button 
+                onClick={refreshPaxData}
+                disabled={isRefreshingPax}
+                className={`p-2 hover:bg-slate-100 rounded-lg text-slate-400 transition-colors ${isRefreshingPax ? 'animate-pulse' : ''}`}
+                title="Refresh Pax from Sales"
+              >
+                <RefreshCw className={`w-5 h-5 ${isRefreshingPax ? 'animate-spin' : ''}`} />
+              </button>
+              
+              <AnimatePresence>
+                {paxUpdateMessage && (
+                  <motion.div
+                    initial={{ opacity: 0, y: 10, scale: 0.9 }}
+                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                    exit={{ opacity: 0, scale: 0.9 }}
+                    className={`absolute top-full right-0 mt-2 w-48 p-2 rounded-xl shadow-xl border text-[10px] font-bold z-50 ${
+                      paxUpdateMessage.type === 'success' 
+                        ? 'bg-emerald-50 border-emerald-100 text-emerald-600' 
+                        : 'bg-rose-50 border-rose-100 text-rose-600'
+                    }`}
+                  >
+                    {paxUpdateMessage.text}
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
             <button 
               onClick={() => setShowDebug(!showDebug)}
               className={`p-2 rounded-lg transition-colors ${showDebug ? 'bg-amber-100 text-amber-600' : 'hover:bg-slate-100 text-slate-400'}`}
