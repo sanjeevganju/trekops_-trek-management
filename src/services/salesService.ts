@@ -13,6 +13,11 @@ export interface SalesTrip {
   region: string;
   location: string;
   status: string;
+  tripLeader?: string;
+  cook?: string;
+  assistantGuides?: string[];
+  supportStaff?: string[];
+  personalPorters?: string[];
 }
 
 const REGION_MAP: Record<string, string> = {
@@ -136,6 +141,13 @@ export async function fetchSalesTrips(): Promise<SalesTrip[]> {
         const nameSlug = name.toLowerCase().trim().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
         const stableId = `trek-${nameSlug}-${startDate}`;
 
+        // Team Parsing (H to Y)
+        const tripLeader = row[7]?.trim();
+        const cook = row[8]?.trim();
+        const assistantGuides = [row[9], row[10], row[11], row[12], row[13]].map(s => s?.trim()).filter(Boolean) as string[];
+        const supportStaff = [row[14], row[15], row[16], row[17], row[18]].map(s => s?.trim()).filter(Boolean) as string[];
+        const personalPorters = [row[19], row[20], row[21], row[22], row[23], row[24]].map(s => s?.trim()).filter(Boolean) as string[];
+
         return {
           id: stableId,
           name: name,
@@ -145,7 +157,12 @@ export async function fetchSalesTrips(): Promise<SalesTrip[]> {
           region: mappedRegion,
           location: (row[regionIdx + 1] || '').trim() || 'Various',
           type: 'Trek',
-          status: 'open'
+          status: 'open',
+          tripLeader,
+          cook,
+          assistantGuides,
+          supportStaff,
+          personalPorters
         };
       });
 

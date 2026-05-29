@@ -392,11 +392,16 @@ function TrekOpsApp() {
   const [drivers, setDrivers] = useState<Driver[]>([]);
   const [vehicles, setVehicles] = useState<Vehicle[]>([]);
   const [isLoadingSales, setIsLoadingSales] = useState(false);
-  const [isRefreshingPax, setIsRefreshingPax] = useState(false);
-  const [paxUpdateMessage, setPaxUpdateMessage] = useState<{ text: string, type: 'success' | 'error' } | null>(null);
+  const [isRefreshingData, setIsRefreshingData] = useState(false);
+  const [syncStatusMessage, setSyncStatusMessage] = useState<{ text: string, type: 'success' | 'error' } | null>(null);
   const [isImporting, setIsImporting] = useState(false);
   const [salesError, setSalesError] = useState<string | null>(null);
   const [showCompletedSales, setShowCompletedSales] = useState(false);
+
+  const getStaffDetails = (name: string) => {
+    const s = staff.find(x => x.name.toLowerCase().trim() === name.toLowerCase().trim());
+    return { name, contact: s?.contact || '' };
+  };
 
   const [isFirestoreOffline, setIsFirestoreOffline] = useState(false);
   const [isTreksLoading, setIsTreksLoading] = useState(true);
@@ -1276,14 +1281,38 @@ function TrekOpsApp() {
           // Generate Stable ID for tasks too: task-[trek-id]-[task-title-slug]
           const taskStableId = getTaskStableId(stableId, template.title);
           
-          taskPromises.push(setDoc(doc(db, 'tasks', taskStableId), {
+          let taskData: any = {
             id: taskStableId,
             trekId: stableId,
             category,
             ...template,
             status: 'pending',
             createdAt: serverTimestamp()
-          }));
+          };
+
+          // Auto-populate Team Assigned tasks if tripData is from Sales
+          if (tripData && category === 'Team Assigned') {
+            if (template.title === 'Trip Leader' && tripData.tripLeader) {
+              const details = getStaffDetails(tripData.tripLeader);
+              taskData.value = details.name;
+              taskData.contact = details.contact;
+            } else if (template.title === 'Cook' && tripData.cook) {
+              const details = getStaffDetails(tripData.cook);
+              taskData.value = details.name;
+              taskData.contact = details.contact;
+            } else if (template.title === 'Assistant Guides' && tripData.assistantGuides?.length) {
+              taskData.value = tripData.assistantGuides.length;
+              taskData.subtasks = tripData.assistantGuides.map(name => getStaffDetails(name));
+            } else if (template.title === 'Support Staff' && tripData.supportStaff?.length) {
+              taskData.value = tripData.supportStaff.length;
+              taskData.subtasks = tripData.supportStaff.map(name => getStaffDetails(name));
+            } else if (template.title === 'Personal Porter' && tripData.personalPorters?.length) {
+              taskData.value = tripData.personalPorters.length;
+              taskData.subtasks = tripData.personalPorters.map(name => getStaffDetails(name));
+            }
+          }
+          
+          taskPromises.push(setDoc(doc(db, 'tasks', taskStableId), taskData));
         });
       });
 
@@ -1364,18 +1393,19 @@ function TrekOpsApp() {
     }
   };
 
-  const refreshPaxData = async () => {
-    if (isRefreshingPax) return;
+  const refreshTrekData = async () => {
+    if (isRefreshingData) return;
     
-    setPaxUpdateMessage(null);
-    setIsRefreshingPax(true);
-    console.log('refreshPaxData: Starting sync...');
+    setSyncStatusMessage(null);
+    setIsRefreshingData(true);
+    console.log('refreshTrekData: Starting sync...');
 
     try {
       const salesData = await fetchSalesTrips();
-      console.log(`refreshPaxData: Fetched ${salesData.length} trips from sales.`);
+      console.log(`refreshTrekData: Fetched ${salesData.length} trips from sales.`);
       
-      let updateCount = 0;
+      let trekUpdateCount = 0;
+      let taskUpdateCount = 0;
       const batch = writeBatch(db);
 
       for (const trek of treks) {
@@ -1386,34 +1416,96 @@ function TrekOpsApp() {
         );
 
         if (matchingTrip) {
+          // 1. Sync Pax Count
           const salesPax = Number(matchingTrip.pax);
           const currentPax = Number(trek.pax);
-          
           if (salesPax !== currentPax) {
-            console.log(`refreshPaxData: Updating ${trek.name} pax from ${currentPax} to ${salesPax}`);
+            console.log(`refreshTrekData: Updating ${trek.name} pax from ${currentPax} to ${salesPax}`);
             const trekRef = doc(db, 'treks', trek.id);
             batch.update(trekRef, { 
               pax: salesPax,
-              salesTripId: matchingTrip.id // Ensure we save the ID for future syncs
+              salesTripId: matchingTrip.id 
             });
-            updateCount++;
+            trekUpdateCount++;
+          }
+
+          // 2. Sync Team Data
+          const trekTasks = tasks.filter(t => t.trekId === trek.id && t.category === 'Team Assigned');
+          
+          for (const task of trekTasks) {
+            let updatedValue: any = null;
+            let updatedContact: string | null = null;
+            let updatedSubtasks: any[] | null = null;
+
+            if (task.title === 'Trip Leader' && matchingTrip.tripLeader) {
+              const details = getStaffDetails(matchingTrip.tripLeader);
+              if (task.value !== details.name) {
+                updatedValue = details.name;
+                updatedContact = details.contact;
+              }
+            } else if (task.title === 'Cook' && matchingTrip.cook) {
+              const details = getStaffDetails(matchingTrip.cook);
+              if (task.value !== details.name) {
+                updatedValue = details.name;
+                updatedContact = details.contact;
+              }
+            } else if (task.title === 'Assistant Guides' && matchingTrip.assistantGuides) {
+              const salesValue = matchingTrip.assistantGuides.length;
+              const currentSubtasks = (task.subtasks || []).map(s => s.name);
+              const listChanged = JSON.stringify(currentSubtasks) !== JSON.stringify(matchingTrip.assistantGuides);
+              
+              if (Number(task.value || 0) !== salesValue || listChanged) {
+                updatedValue = salesValue;
+                updatedSubtasks = matchingTrip.assistantGuides.map(name => getStaffDetails(name));
+              }
+            } else if (task.title === 'Support Staff' && matchingTrip.supportStaff) {
+              const salesValue = matchingTrip.supportStaff.length;
+              const currentSubtasks = (task.subtasks || []).map(s => s.name);
+              const listChanged = JSON.stringify(currentSubtasks) !== JSON.stringify(matchingTrip.supportStaff);
+
+              if (Number(task.value || 0) !== salesValue || listChanged) {
+                updatedValue = salesValue;
+                updatedSubtasks = matchingTrip.supportStaff.map(name => getStaffDetails(name));
+              }
+            } else if (task.title === 'Personal Porter' && matchingTrip.personalPorters) {
+              const salesValue = matchingTrip.personalPorters.length;
+              const currentSubtasks = (task.subtasks || []).map(s => s.name);
+              const listChanged = JSON.stringify(currentSubtasks) !== JSON.stringify(matchingTrip.personalPorters);
+
+              if (Number(task.value || 0) !== salesValue || listChanged) {
+                updatedValue = salesValue;
+                updatedSubtasks = matchingTrip.personalPorters.map(name => getStaffDetails(name));
+              }
+            }
+
+            if (updatedValue !== null) {
+              const taskRef = doc(db, 'tasks', task.id);
+              const updateData: any = { value: updatedValue };
+              if (updatedContact !== null) updateData.contact = updatedContact;
+              if (updatedSubtasks !== null) updateData.subtasks = updatedSubtasks;
+              
+              batch.update(taskRef, updateData);
+              taskUpdateCount++;
+            }
           }
         }
       }
 
-      if (updateCount > 0) {
+      if (trekUpdateCount > 0 || taskUpdateCount > 0) {
         await batch.commit();
-        setPaxUpdateMessage({ text: `Successfully updated pax for ${updateCount} treks!`, type: 'success' });
+        setSyncStatusMessage({ 
+          text: `Updated ${trekUpdateCount} treks and ${taskUpdateCount} team assignments!`, 
+          type: 'success' 
+        });
       } else {
-        setPaxUpdateMessage({ text: "All pax counts are already up to date.", type: 'success' });
+        setSyncStatusMessage({ text: "All data is already up to date.", type: 'success' });
       }
     } catch (error: any) {
-      console.error("Error refreshing pax data:", error);
-      setPaxUpdateMessage({ text: `Failed to refresh: ${error.message}`, type: 'error' });
+      console.error("Error refreshing data:", error);
+      setSyncStatusMessage({ text: `Failed to refresh: ${error.message}`, type: 'error' });
     } finally {
-      setIsRefreshingPax(false);
-      // Clear message after 5 seconds
-      setTimeout(() => setPaxUpdateMessage(null), 5000);
+      setIsRefreshingData(false);
+      setTimeout(() => setSyncStatusMessage(null), 5000);
     }
   };
 
@@ -1733,27 +1825,27 @@ function TrekOpsApp() {
             </button>
             <div className="relative">
               <button 
-                onClick={refreshPaxData}
-                disabled={isRefreshingPax}
-                className={`p-2 hover:bg-slate-100 rounded-lg text-slate-400 transition-colors ${isRefreshingPax ? 'animate-pulse' : ''}`}
-                title="Refresh Pax from Sales"
+                onClick={refreshTrekData}
+                disabled={isRefreshingData}
+                className={`p-2 hover:bg-slate-100 rounded-lg text-slate-400 transition-colors ${isRefreshingData ? 'animate-pulse' : ''}`}
+                title="Sync from Sales Sheet"
               >
-                <RefreshCw className={`w-5 h-5 ${isRefreshingPax ? 'animate-spin' : ''}`} />
+                <RefreshCw className={`w-5 h-5 ${isRefreshingData ? 'animate-spin' : ''}`} />
               </button>
               
               <AnimatePresence>
-                {paxUpdateMessage && (
+                {syncStatusMessage && (
                   <motion.div
                     initial={{ opacity: 0, y: 10, scale: 0.9 }}
                     animate={{ opacity: 1, y: 0, scale: 1 }}
                     exit={{ opacity: 0, scale: 0.9 }}
                     className={`absolute top-full right-0 mt-2 w-48 p-2 rounded-xl shadow-xl border text-[10px] font-bold z-50 ${
-                      paxUpdateMessage.type === 'success' 
+                      syncStatusMessage.type === 'success' 
                         ? 'bg-emerald-50 border-emerald-100 text-emerald-600' 
                         : 'bg-rose-50 border-rose-100 text-rose-600'
                     }`}
                   >
-                    {paxUpdateMessage.text}
+                    {syncStatusMessage.text}
                   </motion.div>
                 )}
               </AnimatePresence>
@@ -2418,8 +2510,19 @@ function TrekOpsApp() {
                                           }}
                                         >
                                           <option value="">Select Staff...</option>
-                                          {staff.filter(s => s.role?.toUpperCase() !== 'COOK').map(s => <option key={s.name} value={s.name}>{s.name}</option>)
-                                        }
+                                          {(() => {
+                                            const options = staff.filter(s => s.role?.toUpperCase() !== 'COOK');
+                                            const currentName = task.subtasks?.[sIdx]?.name;
+                                            const nameExists = currentName && options.some(s => s.name === currentName);
+                                            return (
+                                              <>
+                                                {currentName && !nameExists && (
+                                                  <option value={currentName}>{currentName} (from Sheet)</option>
+                                                )}
+                                                {options.map(s => <option key={s.name} value={s.name}>{s.name}</option>)}
+                                              </>
+                                            );
+                                          })()}
                                         </select>
                                         <input 
                                           type="text" 
@@ -2690,32 +2793,57 @@ function TrekOpsApp() {
 
                                   {task.type === 'select' && (
                                     <div className="space-y-3">
-                                      <select 
-                                        disabled={isReadOnly}
-                                        value={task.value || ''}
-                                        onChange={(e) => {
-                                          const val = e.target.value;
-                                          updateTaskValue(task.id, 'value', val);
-                                          // Auto-populate contact for Trip Leader or any Team Assigned select
-                                          if (task.category === 'Team Assigned') {
-                                            const selectedStaff = staff.find(s => s.name === val);
-                                            if (selectedStaff) {
-                                              updateTaskValue(task.id, 'contact', selectedStaff.contact);
+                                        <select 
+                                          disabled={isReadOnly}
+                                          value={task.value || ''}
+                                          onChange={(e) => {
+                                            const val = e.target.value;
+                                            updateTaskValue(task.id, 'value', val);
+                                            // Auto-populate contact for Trip Leader or any Team Assigned select
+                                            if (task.category === 'Team Assigned') {
+                                              const selectedStaff = staff.find(s => s.name === val);
+                                              if (selectedStaff) {
+                                                updateTaskValue(task.id, 'contact', selectedStaff.contact);
+                                              }
                                             }
-                                          }
-                                        }}
-                                        className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-2.5 text-sm outline-none focus:ring-2 focus:ring-emerald-500 appearance-none disabled:opacity-50"
-                                      >
-                                        <option value="">Select {task.title}...</option>
-                                        {task.category === 'Team Assigned' && task.title === 'Cook' 
-                                          ? staff.filter(s => s.role?.toUpperCase() === 'COOK').map(s => <option key={s.name} value={s.name}>{s.name}</option>)
-                                          : task.category === 'Team Assigned' && task.title === 'Horseman'
-                                          ? staff.filter(s => s.role?.toUpperCase().includes('HORSEMAN') && (!selectedTrek?.region || normalizeRegion(s.region) === normalizeRegion(selectedTrek.region))).map(s => <option key={s.name} value={s.name}>{s.name}</option>)
-                                          : task.category === 'Team Assigned' && task.title === 'Trip Leader'
-                                          ? staff.filter(s => s.role?.toUpperCase() !== 'COOK').map(s => <option key={s.name} value={s.name}>{s.name}</option>)
-                                          : task.options?.map(opt => <option key={opt} value={opt}>{opt}</option>)
-                                        }
-                                      </select>
+                                          }}
+                                          className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-2.5 text-sm outline-none focus:ring-2 focus:ring-emerald-500 appearance-none disabled:opacity-50"
+                                        >
+                                          <option value="">Select {task.title}...</option>
+                                          {(() => {
+                                            let options = [];
+                                            if (task.category === 'Team Assigned' && task.title === 'Cook') {
+                                              options = staff.filter(s => s.role?.toUpperCase() === 'COOK');
+                                            } else if (task.category === 'Team Assigned' && task.title === 'Horseman') {
+                                              options = staff.filter(s => s.role?.toUpperCase().includes('HORSEMAN') && (!selectedTrek?.region || normalizeRegion(s.region) === normalizeRegion(selectedTrek.region)));
+                                            } else if (task.category === 'Team Assigned' && task.title === 'Trip Leader') {
+                                              options = staff.filter(s => s.role?.toUpperCase() !== 'COOK');
+                                            } else {
+                                              // Handle other team options if they exist
+                                              const opts = task.options || [];
+                                              return (
+                                                <>
+                                                  {task.value && !opts.includes(task.value as string) && (
+                                                    <option value={task.value as string}>{task.value as string} (from Sheet)</option>
+                                                  )}
+                                                  {opts.map(opt => <option key={opt} value={opt}>{opt}</option>)}
+                                                </>
+                                              );
+                                            }
+
+                                            const currentName = task.value as string;
+                                            const nameExists = currentName && options.some(s => s.name === currentName);
+
+                                            return (
+                                              <>
+                                                {currentName && !nameExists && (
+                                                  <option value={currentName}>{currentName} (from Sheet)</option>
+                                                )}
+                                                {options.map(s => <option key={s.name} value={s.name}>{s.name}</option>)}
+                                              </>
+                                            );
+                                          })()}
+                                        </select>
                                       <input 
                                         type="text" 
                                         disabled={isReadOnly}
